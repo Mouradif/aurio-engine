@@ -57,16 +57,17 @@ impl AudioGraph {
             let output = match &mut self.nodes[node_idx] {
                 AudioNode::Source(instrument) => instrument.next_sample(sample_rate),
                 AudioNode::Processor(effect) => effect.process(input),
-                AudioNode::Output => 0.0,
+                AudioNode::Output => input,
             };
 
             self.buffers[node_idx] = output;
         }
 
         self.order
-            .last()
+            .iter()
+            .filter(|&&idx| matches!(self.nodes[idx], AudioNode::Output))
             .map(|&idx| self.buffers[idx])
-            .unwrap_or(0.0)
+            .sum()
     }
 }
 

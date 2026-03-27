@@ -93,8 +93,9 @@ fn main() {
             AudioNode::Source(Box::new(synth)),
             AudioNode::Processor(Box::new(reverb)),
             AudioNode::Processor(Box::new(gain)),
+            AudioNode::Output,
         ],
-        vec![(0, 1), (1, 2)],
+        vec![(0, 1), (1, 2), (2, 3), (0, 3)],
     )
     .unwrap_or_else(|err| {
         eprintln!("Error instanciating audio graph: {}", err);
