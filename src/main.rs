@@ -2,8 +2,12 @@ use aurio::audio_graph::{AudioGraph, AudioNode};
 use aurio::effect::{Gain, Reverb};
 use aurio::midi::{MidiNote, ScheduledEvent};
 use aurio::oscillator::{Oscillator, Wave};
-use aurio::state_graph::{Phrase, StateGraph, Transition, run_timing_thread};
+use aurio::phrase::Phrase;
+use aurio::phrase_script::PhraseScript;
+use aurio::state_graph::{StateGraph, run_timing_thread};
+use aurio::static_phrase::StaticPhrase;
 use aurio::synth::{ADSR, Synth};
+use aurio::transition::Transition;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Split};
@@ -11,23 +15,10 @@ use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-fn forest_melody() -> Vec<Phrase> {
-    let pitches_a = [79, 84, 86, 91];
-    let pitches_b = [81, 84, 88, 89];
+fn forest_melody() -> Vec<Box<dyn Phrase + Send>> {
+    let pitches = [79, 84, 86, 91];
 
-    let notes_a: Vec<MidiNote> = pitches_a
-        .iter()
-        .cycle()
-        .take(32)
-        .enumerate()
-        .map(|(i, &pitch)| MidiNote {
-            pitch,
-            velocity: 100,
-            start_beat: (i as f32) / 4.0,
-            duration_beats: 0.2,
-        })
-        .collect();
-    let notes_b: Vec<MidiNote> = pitches_b
+    let notes: Vec<MidiNote> = pitches
         .iter()
         .cycle()
         .take(32)
@@ -41,8 +32,25 @@ fn forest_melody() -> Vec<Phrase> {
         .collect();
 
     vec![
-        Phrase::new("A".to_owned(), notes_a, 8.0),
-        Phrase::new("B".to_owned(), notes_b, 8.0),
+        Box::new(StaticPhrase::new("A".to_owned(), notes, 8.0)),
+        Box::new(PhraseScript::new(
+            "B".to_owned(),
+            8.0,
+            r#"
+                local notes = {}
+                local pitches = {81, 84, 88, 89}
+                for i = 0, 31 do
+                    notes[#notes + 1] = {
+                        pitch = pitches[i % 4 + 1],
+                        velocity = 100,
+                        start_beat = i / 4.0,
+                        duration_beats = 0.2,
+                    }
+                end
+                return notes
+            "#
+            .to_owned(),
+        )),
     ]
 }
 

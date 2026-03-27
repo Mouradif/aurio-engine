@@ -1,7 +1,7 @@
 use ringbuf::HeapProd;
 use ringbuf::traits::Producer;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MidiNote {
     pub pitch: u8,
     pub velocity: u8,

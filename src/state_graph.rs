@@ -1,60 +1,28 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    thread::sleep,
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
-use crate::midi::{MidiNote, ScheduledEvent, schedule_phrase};
+use crate::{
+    midi::{ScheduledEvent, schedule_phrase},
+    phrase::Phrase,
+    scripting::LuaRuntime,
+    transition::Transition,
+};
 use ringbuf::HeapProd;
 
-#[derive(Debug)]
-pub struct Phrase {
-    pub name: String,
-    pub duration_beats: f32,
-    pub notes: Vec<MidiNote>,
-}
-
-impl Phrase {
-    pub fn new(name: String, notes: Vec<MidiNote>, duration_beats: f32) -> Self {
-        Self {
-            name,
-            duration_beats,
-            notes,
-        }
-    }
-}
-
-pub struct Transition {
-    pub from: usize,
-    pub to: usize,
-    pub condition: Box<dyn Fn() -> bool + Send>,
-}
-
-impl Transition {
-    pub fn new(from: usize, to: usize, condition: Box<dyn Fn() -> bool + Send>) -> Self {
-        Self {
-            from,
-            to,
-            condition,
-        }
-    }
-
-    pub fn always(from: usize, to: usize) -> Self {
-        Self::new(from, to, Box::new(|| true))
-    }
-}
-
 pub struct StateGraph {
-    phrases: Vec<Phrase>,
+    phrases: Vec<Box<dyn Phrase + Send>>,
     transitions: Vec<Transition>,
     initial: usize,
 }
 
 impl StateGraph {
-    pub fn new(phrases: Vec<Phrase>, transitions: Vec<Transition>, initial: usize) -> Self {
+    pub fn new(
+        phrases: Vec<Box<dyn Phrase + Send>>,
+        transitions: Vec<Transition>,
+        initial: usize,
+    ) -> Self {
         let max = phrases.len() - 1;
         Self {
             phrases,
@@ -67,14 +35,24 @@ impl StateGraph {
         self.initial
     }
 
-    pub fn phrase(&self, id: usize) -> &Phrase {
-        &self.phrases[id]
+    pub fn phrase(&self, id: usize) -> &dyn Phrase {
+        &*self.phrases[id]
     }
 
-    pub fn next_phrase(&self, current: usize) -> usize {
+    pub fn next_phrase(&self, current: usize, lua: &LuaRuntime) -> usize {
         for transition in &self.transitions {
-            if transition.from == current && (transition.condition)() {
-                return transition.to;
+            if transition.from == current {
+                match lua.eval_condition(&transition.condition) {
+                    Ok(true) => return transition.to,
+                    Ok(false) => continue,
+                    Err(err) => {
+                        eprintln!(
+                            "[lua error] edge {} -> {}: {}",
+                            transition.from, transition.to, err
+                        );
+                        continue;
+                    }
+                }
             }
         }
         current
@@ -88,36 +66,38 @@ pub fn run_timing_thread(
     bpm: f32,
     sample_rate: f32,
 ) {
+    let lua = LuaRuntime::new();
     let mut current_phrase = graph.initial();
 
     let phrase = graph.phrase(current_phrase);
+    let notes = phrase.notes(&lua);
     let mut phrase_end = schedule_phrase(
-        &phrase.notes,
-        phrase.duration_beats,
+        &notes,
+        phrase.duration_beats(),
         bpm,
         sample_rate,
         0,
         &mut producer,
     );
 
-    println!("[timing] Starting with phrase: {}", phrase.name);
+    println!("[timing] Starting with phrase: {}", phrase.name());
 
     loop {
-        sleep(Duration::from_millis(1));
         let current_sample = sample_counter.load(Ordering::Relaxed);
         if current_sample < phrase_end {
             continue;
         }
-        let next = graph.next_phrase(current_phrase);
+        let next = graph.next_phrase(current_phrase, &lua);
         let phrase = graph.phrase(next);
 
-        println!("[timing] Transition to {}", phrase.name);
+        println!("[timing] Transition to {}", phrase.name());
 
         current_phrase = next;
+        let notes = phrase.notes(&lua);
 
         phrase_end = schedule_phrase(
-            &phrase.notes,
-            phrase.duration_beats,
+            &notes,
+            phrase.duration_beats(),
             bpm,
             sample_rate,
             phrase_end,
