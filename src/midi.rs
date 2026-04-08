@@ -1,6 +1,3 @@
-use ringbuf::HeapProd;
-use ringbuf::traits::Producer;
-
 #[derive(Debug, Clone)]
 pub struct MidiNote {
     pub pitch: u8,
@@ -17,13 +14,18 @@ pub enum NoteEvent {
 
 #[derive(Clone, Debug)]
 pub struct ScheduledEvent {
+    pub targets: Vec<usize>,
     pub sample: u64,
     pub event: NoteEvent,
 }
 
 impl ScheduledEvent {
-    pub fn new(sample: u64, event: NoteEvent) -> Self {
-        Self { sample, event }
+    pub fn new(targets: Vec<usize>, sample: u64, event: NoteEvent) -> Self {
+        Self {
+            targets,
+            sample,
+            event,
+        }
     }
 }
 
@@ -32,13 +34,13 @@ pub fn midi_to_freq(note: u8) -> f32 {
 }
 
 pub fn schedule_phrase(
+    targets: &Vec<usize>,
     notes: &[MidiNote],
     duration_beats: f32,
     bpm: f32,
     sample_rate: f32,
     start_sample: u64,
-    producer: &mut HeapProd<ScheduledEvent>,
-) -> u64 {
+) -> (u64, Vec<ScheduledEvent>) {
     let sample_per_beat = (60.0 / bpm) * sample_rate;
     let phrase_duration_samples = (duration_beats * sample_per_beat) as u64;
     let phrase_end = start_sample + phrase_duration_samples;
@@ -54,6 +56,7 @@ pub fn schedule_phrase(
         let off_sample = on_sample + (note.duration_beats * sample_per_beat) as u64;
 
         events.push(ScheduledEvent::new(
+            targets.clone(),
             on_sample,
             NoteEvent::NoteOn {
                 pitch: note.pitch,
@@ -61,13 +64,11 @@ pub fn schedule_phrase(
             },
         ));
         events.push(ScheduledEvent::new(
+            targets.clone(),
             off_sample.clamp(0, phrase_end),
             NoteEvent::NoteOff { pitch: note.pitch },
         ));
     }
     events.sort_by_key(|e| e.sample);
-    for event in events {
-        let _ = producer.try_push(event);
-    }
-    phrase_end
+    (phrase_end, events)
 }

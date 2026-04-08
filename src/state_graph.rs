@@ -9,9 +9,10 @@ use crate::{
     scripting::LuaRuntime,
     transition::Transition,
 };
-use ringbuf::HeapProd;
+use ringbuf::{HeapProd, traits::Producer};
 
 pub struct StateGraph {
+    targets: Vec<usize>,
     phrases: Vec<Box<dyn Phrase + Send>>,
     transitions: Vec<Transition>,
     initial: usize,
@@ -19,12 +20,14 @@ pub struct StateGraph {
 
 impl StateGraph {
     pub fn new(
+        targets: Vec<usize>,
         phrases: Vec<Box<dyn Phrase + Send>>,
         transitions: Vec<Transition>,
         initial: usize,
     ) -> Self {
         let max = phrases.len() - 1;
         Self {
+            targets,
             phrases,
             transitions,
             initial: initial.clamp(0, max),
@@ -60,48 +63,72 @@ impl StateGraph {
 }
 
 pub fn run_timing_thread(
-    graph: StateGraph,
+    lua: &LuaRuntime,
+    graphs: Vec<StateGraph>,
     mut producer: HeapProd<ScheduledEvent>,
     sample_counter: Arc<AtomicU64>,
     bpm: f32,
     sample_rate: f32,
 ) {
-    let lua = LuaRuntime::new();
-    let mut current_phrase = graph.initial();
+    let tracks = graphs.len();
+    let mut current_phrases: Vec<usize> = vec![0; tracks];
+    let mut phrase_ends: Vec<u64> = vec![0; tracks];
+    let mut pending_events: Vec<ScheduledEvent> = Vec::with_capacity(128);
+    for i in 0..tracks {
+        let graph = &graphs[i];
 
-    let phrase = graph.phrase(current_phrase);
-    let notes = phrase.notes(&lua);
-    let mut phrase_end = schedule_phrase(
-        &notes,
-        phrase.duration_beats(),
-        bpm,
-        sample_rate,
-        0,
-        &mut producer,
-    );
-
-    println!("[timing] Starting with phrase: {}", phrase.name());
-
-    loop {
-        let current_sample = sample_counter.load(Ordering::Relaxed);
-        if current_sample < phrase_end {
-            continue;
-        }
-        let next = graph.next_phrase(current_phrase, &lua);
-        let phrase = graph.phrase(next);
-
-        println!("[timing] Transition to {}", phrase.name());
-
-        current_phrase = next;
+        current_phrases[i] = graph.initial();
+        let phrase = graph.phrase(current_phrases[i]);
         let notes = phrase.notes(&lua);
-
-        phrase_end = schedule_phrase(
+        let (phrase_end, events) = schedule_phrase(
+            &graph.targets,
             &notes,
             phrase.duration_beats(),
             bpm,
             sample_rate,
-            phrase_end,
-            &mut producer,
+            0,
         );
+        phrase_ends[i] = phrase_end;
+        pending_events.extend(events);
+    }
+    let cutoff = phrase_ends.iter().cloned().min().unwrap_or(0);
+    pending_events.sort_by_key(|e| e.sample);
+    let cut = pending_events.partition_point(|e| e.sample < cutoff);
+    pending_events.drain(..cut).for_each(|e| {
+        let _ = producer.try_push(e);
+    });
+
+    loop {
+        for i in 0..tracks {
+            let graph = &graphs[i];
+            let current_sample = sample_counter.load(Ordering::Relaxed);
+            if current_sample < phrase_ends[i] {
+                continue;
+            }
+            let next = graph.next_phrase(current_phrases[i], &lua);
+            let phrase = graph.phrase(next);
+
+            println!("[timing] Transition to {}", phrase.name());
+
+            current_phrases[i] = next;
+            let notes = phrase.notes(&lua);
+
+            let (phrase_end, events) = schedule_phrase(
+                &graph.targets,
+                &notes,
+                phrase.duration_beats(),
+                bpm,
+                sample_rate,
+                phrase_ends[i],
+            );
+            phrase_ends[i] = phrase_end;
+            pending_events.extend(events);
+        }
+        let cutoff = phrase_ends.iter().cloned().min().unwrap_or(0);
+        pending_events.sort_by_key(|e| e.sample);
+        let cut = pending_events.partition_point(|e| e.sample < cutoff);
+        pending_events.drain(..cut).for_each(|e| {
+            let _ = producer.try_push(e);
+        });
     }
 }

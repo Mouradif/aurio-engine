@@ -32,3 +32,13 @@ impl LuaRuntime {
         Ok(result)
     }
 }
+
+pub fn eval_or_empty(lua: &LuaRuntime, code: &String) -> Vec<MidiNote> {
+    match lua.eval_pattern(code) {
+        Ok(notes) => notes,
+        Err(err) => {
+            eprintln!("[lua_error]: {}", err);
+            Vec::new()
+        }
+    }
+}

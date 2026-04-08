@@ -104,14 +104,16 @@ impl Voice {
 }
 
 pub struct Synth {
+    pub id: usize,
     pub adsr: ADSR,
     pub oscillators: Vec<(Oscillator, f32)>,
     voices: Vec<Voice>,
 }
 
 impl Synth {
-    pub fn new(adsr: ADSR, oscillators: Vec<(Oscillator, f32)>) -> Self {
+    pub fn new(id: usize, adsr: ADSR, oscillators: Vec<(Oscillator, f32)>) -> Self {
         Self {
+            id,
             adsr,
             oscillators,
             voices: Vec::new(),
@@ -154,5 +156,9 @@ impl Instrument for Synth {
         }
         self.voices.retain(|v| !v.is_done());
         output
+    }
+
+    fn id(&self) -> usize {
+        self.id
     }
 }

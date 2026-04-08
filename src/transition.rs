@@ -1,3 +1,4 @@
+#[derive(Clone)]
 pub struct Transition {
     pub from: usize,
     pub to: usize,

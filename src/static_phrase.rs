@@ -1,18 +1,40 @@
-use crate::{midi::MidiNote, phrase::Phrase, scripting::LuaRuntime};
+use crate::{
+    midi::MidiNote,
+    phrase::Phrase,
+    rtttl::parse_rtttl,
+    scripting::{LuaRuntime, eval_or_empty},
+};
 
 #[derive(Debug)]
 pub struct StaticPhrase {
     pub name: String,
-    pub duration_beats: f32,
     pub notes: Vec<MidiNote>,
+    pub duration_beats: f32,
 }
 
 impl StaticPhrase {
     pub fn new(name: String, notes: Vec<MidiNote>, duration_beats: f32) -> Self {
         Self {
             name,
-            duration_beats,
             notes,
+            duration_beats,
+        }
+    }
+
+    pub fn from_lua(lua: &LuaRuntime, name: String, code: String, duration_beats: f32) -> Self {
+        Self {
+            name,
+            notes: eval_or_empty(lua, &code),
+            duration_beats,
+        }
+    }
+
+    pub fn from_rtttl(name: String, rtttl: &str) -> Self {
+        let (duration_beats, notes) = parse_rtttl(rtttl);
+        Self {
+            name,
+            notes,
+            duration_beats,
         }
     }
 }

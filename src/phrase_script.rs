@@ -1,4 +1,8 @@
-use crate::phrase::Phrase;
+use crate::{
+    midi::MidiNote,
+    phrase::Phrase,
+    scripting::{LuaRuntime, eval_or_empty},
+};
 
 pub struct PhraseScript {
     pub name: String,
@@ -7,7 +11,7 @@ pub struct PhraseScript {
 }
 
 impl PhraseScript {
-    pub fn new(name: String, duration_beats: f32, code: String) -> Self {
+    pub fn new(name: String, code: String, duration_beats: f32) -> Self {
         Self {
             name,
             duration_beats,
@@ -25,13 +29,7 @@ impl Phrase for PhraseScript {
         self.duration_beats
     }
 
-    fn notes(&self, lua: &crate::scripting::LuaRuntime) -> Vec<crate::midi::MidiNote> {
-        match lua.eval_pattern(&self.code) {
-            Ok(notes) => notes,
-            Err(err) => {
-                eprintln!("[lua_error] {}: {}", self.name, err);
-                Vec::new()
-            }
-        }
+    fn notes(&self, lua: &LuaRuntime) -> Vec<MidiNote> {
+        eval_or_empty(lua, &self.code)
     }
 }
