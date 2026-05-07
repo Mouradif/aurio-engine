@@ -5,6 +5,7 @@ pub mod midi;
 pub mod oscillator;
 pub mod phrase;
 pub mod phrase_script;
+pub mod project;
 pub mod rtttl;
 pub mod scripting;
 pub mod state_graph;
