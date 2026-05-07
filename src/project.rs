@@ -2,7 +2,7 @@ use crate::audio_graph::{AudioGraph, AudioNode};
 use crate::effect::{Effect, Gain, Reverb};
 use crate::midi::{MidiNote, ScheduledEvent};
 use crate::oscillator::{Oscillator, Wave};
-use crate::phrase::Phrase;
+use crate::phrase::{PhraseEntry, PhraseHooks};
 use crate::phrase_script::PhraseScript;
 use crate::scripting::LuaRuntime;
 use crate::state_graph::{StateGraph, run_timing_thread};
@@ -13,6 +13,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Split};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -22,7 +23,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct Song {
     pub bpm: f32,
     pub instruments: Vec<InstrumentConfig>,
+    #[serde(default)]
+    pub effects: Vec<EffectEntry>,
+    #[serde(default)]
+    pub outputs: Vec<OutputEntry>,
+    #[serde(default)]
+    pub connections: Vec<Connection>,
     pub tracks: Vec<TrackConfig>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct OutputEntry {
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -30,14 +42,18 @@ pub struct InstrumentConfig {
     pub id: usize,
     pub adsr: ADSR,
     pub oscillators: Vec<OscillatorConfig>,
-    #[serde(default)]
-    pub effects: Vec<EffectConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct OscillatorConfig {
     pub wave: Wave,
     pub gain: f32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct EffectEntry {
+    pub name: String,
+    pub kind: EffectConfig,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -50,6 +66,19 @@ pub enum EffectConfig {
         feedback: f32,
         mix: f32,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum NodeRef {
+    Instrument(usize),
+    Effect(String),
+    Output(String),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Connection {
+    pub from: NodeRef,
+    pub to: NodeRef,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,20 +97,44 @@ pub enum PatternConfig {
         name: String,
         duration_beats: f32,
         notes: Vec<MidiNoteConfig>,
+        #[serde(default)]
+        on_enter: String,
+        #[serde(default)]
+        on_loop: String,
+        #[serde(default)]
+        on_exit: String,
     },
     Rtttl {
         name: String,
         source: String,
+        #[serde(default)]
+        on_enter: String,
+        #[serde(default)]
+        on_loop: String,
+        #[serde(default)]
+        on_exit: String,
     },
     LuaOnce {
         name: String,
         duration_beats: f32,
         code: String,
+        #[serde(default)]
+        on_enter: String,
+        #[serde(default)]
+        on_loop: String,
+        #[serde(default)]
+        on_exit: String,
     },
     Lua {
         name: String,
         duration_beats: f32,
         code: String,
+        #[serde(default)]
+        on_enter: String,
+        #[serde(default)]
+        on_loop: String,
+        #[serde(default)]
+        on_exit: String,
     },
 }
 
@@ -137,9 +190,9 @@ impl Song {
         println!("Audio: {} Hz, {} channels", sample_rate, channels);
         println!("Playing at {} BPM...", self.bpm);
 
-        let mut audio_nodes: Vec<AudioNode> = vec![AudioNode::Output];
-        let output_idx = 0usize;
-        let mut audio_edges: Vec<(usize, usize)> = Vec::new();
+        let mut audio_nodes: Vec<AudioNode> = Vec::new();
+        let mut instrument_idx: HashMap<usize, usize> = HashMap::new();
+        let mut effect_idx: HashMap<String, usize> = HashMap::new();
 
         for instrument in self.instruments {
             let oscillators: Vec<(Oscillator, f32)> = instrument
@@ -148,36 +201,67 @@ impl Song {
                 .map(|o| (Oscillator::new(o.wave), o.gain))
                 .collect();
             let synth = Synth::new(instrument.id, instrument.adsr, oscillators);
-            let synth_idx = audio_nodes.len();
+            let idx = audio_nodes.len();
             audio_nodes.push(AudioNode::Source(Box::new(synth)));
-
-            let mut prev = synth_idx;
-            for effect_cfg in instrument.effects {
-                let effect: Box<dyn Effect + Send> = match effect_cfg {
-                    EffectConfig::Gain { level } => Box::new(Gain::new(level)),
-                    EffectConfig::Reverb {
-                        delay_seconds,
-                        feedback,
-                        mix,
-                    } => Box::new(Reverb::new(delay_seconds, feedback, mix, sample_rate)),
-                };
-                let eff_idx = audio_nodes.len();
-                audio_nodes.push(AudioNode::Processor(effect));
-                audio_edges.push((prev, eff_idx));
-                prev = eff_idx;
+            if instrument_idx.insert(instrument.id, idx).is_some() {
+                panic!("Duplicate instrument id: {}", instrument.id);
             }
-            audio_edges.push((prev, output_idx));
         }
+
+        for entry in self.effects {
+            let effect: Box<dyn Effect + Send> = match entry.kind {
+                EffectConfig::Gain { level } => Box::new(Gain::new(level)),
+                EffectConfig::Reverb {
+                    delay_seconds,
+                    feedback,
+                    mix,
+                } => Box::new(Reverb::new(delay_seconds, feedback, mix, sample_rate)),
+            };
+            let idx = audio_nodes.len();
+            audio_nodes.push(AudioNode::Processor(effect));
+            if effect_idx.insert(entry.name.clone(), idx).is_some() {
+                panic!("Duplicate effect name: {}", entry.name);
+            }
+        }
+
+        let mut output_idx: HashMap<String, usize> = HashMap::new();
+        for entry in self.outputs {
+            let idx = audio_nodes.len();
+            audio_nodes.push(AudioNode::Output);
+            if output_idx.insert(entry.name.clone(), idx).is_some() {
+                panic!("Duplicate output name: {}", entry.name);
+            }
+        }
+
+        let resolve = |r: &NodeRef| -> usize {
+            match r {
+                NodeRef::Instrument(id) => *instrument_idx
+                    .get(id)
+                    .unwrap_or_else(|| panic!("Unknown instrument id in routing: {}", id)),
+                NodeRef::Effect(name) => *effect_idx
+                    .get(name)
+                    .unwrap_or_else(|| panic!("Unknown effect name in routing: {}", name)),
+                NodeRef::Output(name) => *output_idx
+                    .get(name)
+                    .unwrap_or_else(|| panic!("Unknown output name in routing: {}", name)),
+            }
+        };
+
+        let audio_edges: Vec<(usize, usize)> = self
+            .connections
+            .iter()
+            .map(|c| (resolve(&c.from), resolve(&c.to)))
+            .collect();
 
         let mut audio_graph = AudioGraph::new(audio_nodes, audio_edges)
             .expect("Failed to build audio graph");
 
         let mut state_graphs: Vec<StateGraph> = Vec::with_capacity(self.tracks.len());
         for track in self.tracks {
-            let phrases: Vec<Box<dyn Phrase + Send>> = track
+            let phrases: Vec<PhraseEntry> = track
                 .patterns
                 .into_iter()
-                .map(|p| build_phrase(p, &lua))
+                .map(|p| build_phrase_entry(p, &lua))
                 .collect();
             let transitions: Vec<Transition> = track
                 .transitions
@@ -249,28 +333,69 @@ impl Song {
     }
 }
 
-fn build_phrase(p: PatternConfig, lua: &LuaRuntime) -> Box<dyn Phrase + Send> {
+fn build_phrase_entry(p: PatternConfig, lua: &LuaRuntime) -> PhraseEntry {
     match p {
         PatternConfig::Notes {
             name,
             duration_beats,
             notes,
+            on_enter,
+            on_loop,
+            on_exit,
         } => {
             let notes: Vec<MidiNote> = notes.into_iter().map(Into::into).collect();
-            Box::new(StaticPhrase::new(name, notes, duration_beats))
+            PhraseEntry {
+                phrase: Box::new(StaticPhrase::new(name, notes, duration_beats)),
+                hooks: PhraseHooks {
+                    on_enter,
+                    on_loop,
+                    on_exit,
+                },
+            }
         }
-        PatternConfig::Rtttl { name, source } => {
-            Box::new(StaticPhrase::from_rtttl(name, &source))
-        }
+        PatternConfig::Rtttl {
+            name,
+            source,
+            on_enter,
+            on_loop,
+            on_exit,
+        } => PhraseEntry {
+            phrase: Box::new(StaticPhrase::from_rtttl(name, &source)),
+            hooks: PhraseHooks {
+                on_enter,
+                on_loop,
+                on_exit,
+            },
+        },
         PatternConfig::LuaOnce {
             name,
             duration_beats,
             code,
-        } => Box::new(StaticPhrase::from_lua(lua, name, code, duration_beats)),
+            on_enter,
+            on_loop,
+            on_exit,
+        } => PhraseEntry {
+            phrase: Box::new(StaticPhrase::from_lua(lua, name, code, duration_beats)),
+            hooks: PhraseHooks {
+                on_enter,
+                on_loop,
+                on_exit,
+            },
+        },
         PatternConfig::Lua {
             name,
             duration_beats,
             code,
-        } => Box::new(PhraseScript::new(name, code, duration_beats)),
+            on_enter,
+            on_loop,
+            on_exit,
+        } => PhraseEntry {
+            phrase: Box::new(PhraseScript::new(name, code, duration_beats)),
+            hooks: PhraseHooks {
+                on_enter,
+                on_loop,
+                on_exit,
+            },
+        },
     }
 }

@@ -5,7 +5,7 @@ use std::sync::{
 
 use crate::{
     midi::{ScheduledEvent, schedule_phrase},
-    phrase::Phrase,
+    phrase::PhraseEntry,
     scripting::LuaRuntime,
     transition::Transition,
 };
@@ -13,7 +13,7 @@ use ringbuf::{HeapProd, traits::Producer};
 
 pub struct StateGraph {
     targets: Vec<usize>,
-    phrases: Vec<Box<dyn Phrase + Send>>,
+    phrases: Vec<PhraseEntry>,
     transitions: Vec<Transition>,
     initial: usize,
 }
@@ -21,7 +21,7 @@ pub struct StateGraph {
 impl StateGraph {
     pub fn new(
         targets: Vec<usize>,
-        phrases: Vec<Box<dyn Phrase + Send>>,
+        phrases: Vec<PhraseEntry>,
         transitions: Vec<Transition>,
         initial: usize,
     ) -> Self {
@@ -38,8 +38,8 @@ impl StateGraph {
         self.initial
     }
 
-    pub fn phrase(&self, id: usize) -> &dyn Phrase {
-        &*self.phrases[id]
+    pub fn entry(&self, id: usize) -> &PhraseEntry {
+        &self.phrases[id]
     }
 
     pub fn next_phrase(&self, current: usize, lua: &LuaRuntime) -> usize {
@@ -62,6 +62,15 @@ impl StateGraph {
     }
 }
 
+fn run_hook(lua: &LuaRuntime, code: &str) {
+    if code.is_empty() {
+        return;
+    }
+    if let Err(err) = lua.run(code) {
+        eprintln!("[lua hook error] {}", err);
+    }
+}
+
 pub fn run_timing_thread(
     lua: &LuaRuntime,
     graphs: Vec<StateGraph>,
@@ -78,12 +87,15 @@ pub fn run_timing_thread(
         let graph = &graphs[i];
 
         current_phrases[i] = graph.initial();
-        let phrase = graph.phrase(current_phrases[i]);
-        let notes = phrase.notes(&lua);
+        let entry = graph.entry(current_phrases[i]);
+
+        run_hook(lua, &entry.hooks.on_enter);
+
+        let notes = entry.phrase.notes(lua);
         let (phrase_end, events) = schedule_phrase(
             &graph.targets,
             &notes,
-            phrase.duration_beats(),
+            entry.phrase.duration_beats(),
             bpm,
             sample_rate,
             0,
@@ -105,18 +117,28 @@ pub fn run_timing_thread(
             if current_sample < phrase_ends[i] {
                 continue;
             }
-            let next = graph.next_phrase(current_phrases[i], &lua);
-            let phrase = graph.phrase(next);
+            let from_idx = current_phrases[i];
+            let to_idx = graph.next_phrase(from_idx, lua);
 
-            println!("[timing] Transition to {}", phrase.name());
+            let from_entry = graph.entry(from_idx);
+            let to_entry = graph.entry(to_idx);
 
-            current_phrases[i] = next;
-            let notes = phrase.notes(&lua);
+            if from_idx == to_idx {
+                run_hook(lua, &from_entry.hooks.on_loop);
+            } else {
+                run_hook(lua, &from_entry.hooks.on_exit);
+                run_hook(lua, &to_entry.hooks.on_enter);
+            }
+
+            println!("[timing] Transition to {}", to_entry.phrase.name());
+
+            current_phrases[i] = to_idx;
+            let notes = to_entry.phrase.notes(lua);
 
             let (phrase_end, events) = schedule_phrase(
                 &graph.targets,
                 &notes,
-                phrase.duration_beats(),
+                to_entry.phrase.duration_beats(),
                 bpm,
                 sample_rate,
                 phrase_ends[i],

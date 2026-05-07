@@ -31,6 +31,10 @@ impl LuaRuntime {
         let result: bool = self.lua.load(code).eval()?;
         Ok(result)
     }
+
+    pub fn run(&self, code: &str) -> Result<(), mlua::Error> {
+        self.lua.load(code).exec()
+    }
 }
 
 pub fn eval_or_empty(lua: &LuaRuntime, code: &String) -> Vec<MidiNote> {
