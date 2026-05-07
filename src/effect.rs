@@ -1,5 +1,3 @@
-use std::usize;
-
 pub trait Effect {
     fn process(&mut self, sample: f32) -> f32;
 }

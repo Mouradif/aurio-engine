@@ -7,5 +7,3 @@ edition = "2024"
 cpal = "0.17.3"
 mlua = { version = "0.11.6", features = ["lua54", "send"] }
 ringbuf = "0.4.8"
-ron = "0.12.1"
-serde = { version = "1.0.228", features = ["derive"] }

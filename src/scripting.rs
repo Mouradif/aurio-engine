@@ -1,8 +1,14 @@
 use crate::midi::MidiNote;
-use mlua::Lua;
+use mlua::{Function, Lua, RegistryKey, Table};
 
 pub struct LuaRuntime {
     lua: Lua,
+}
+
+impl Default for LuaRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LuaRuntime {
@@ -10,39 +16,38 @@ impl LuaRuntime {
         Self { lua: Lua::new() }
     }
 
-    pub fn eval_pattern(&self, code: &str) -> Result<Vec<MidiNote>, mlua::Error> {
-        let result: mlua::Table = self.lua.load(code).eval()?;
-
-        let mut notes = Vec::new();
-        for pair in result.pairs::<usize, mlua::Table>() {
-            let (_, table) = pair?;
-            notes.push(MidiNote {
-                pitch: table.get("pitch")?,
-                velocity: table.get("velocity")?,
-                start_beat: table.get("start_beat")?,
-                duration_beats: table.get("duration_beats")?,
-            });
-        }
-
-        Ok(notes)
+    pub fn lua(&self) -> &Lua {
+        &self.lua
     }
 
-    pub fn eval_condition(&self, code: &str) -> Result<bool, mlua::Error> {
-        let result: bool = self.lua.load(code).eval()?;
-        Ok(result)
+    pub fn call_condition(&self, key: &RegistryKey) -> Result<bool, mlua::Error> {
+        let f: Function = self.lua.registry_value(key)?;
+        f.call::<bool>(())
     }
 
-    pub fn run(&self, code: &str) -> Result<(), mlua::Error> {
-        self.lua.load(code).exec()
+    pub fn run_hook(&self, key: &RegistryKey) -> Result<(), mlua::Error> {
+        let f: Function = self.lua.registry_value(key)?;
+        f.call::<()>(())
+    }
+
+    pub fn call_notes(&self, key: &RegistryKey) -> Result<Vec<MidiNote>, mlua::Error> {
+        let f: Function = self.lua.registry_value(key)?;
+        let table: Table = f.call(())?;
+        notes_from_table(&table)
     }
 }
 
-pub fn eval_or_empty(lua: &LuaRuntime, code: &String) -> Vec<MidiNote> {
-    match lua.eval_pattern(code) {
-        Ok(notes) => notes,
-        Err(err) => {
-            eprintln!("[lua_error]: {}", err);
-            Vec::new()
-        }
+pub fn notes_from_table(table: &Table) -> Result<Vec<MidiNote>, mlua::Error> {
+    let mut notes = Vec::new();
+    for pair in table.pairs::<i64, Table>() {
+        let (_, t) = pair?;
+        let velocity: u8 = t.get::<Option<u8>>("velocity")?.unwrap_or(100);
+        notes.push(MidiNote {
+            pitch: t.get("pitch")?,
+            velocity,
+            start_beat: t.get("start")?,
+            duration_beats: t.get("duration")?,
+        });
     }
+    Ok(notes)
 }

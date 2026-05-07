@@ -9,6 +9,7 @@ use crate::{
     scripting::LuaRuntime,
     transition::Transition,
 };
+use mlua::RegistryKey;
 use ringbuf::{HeapProd, traits::Producer};
 
 pub struct StateGraph {
@@ -45,7 +46,11 @@ impl StateGraph {
     pub fn next_phrase(&self, current: usize, lua: &LuaRuntime) -> usize {
         for transition in &self.transitions {
             if transition.from == current {
-                match lua.eval_condition(&transition.condition) {
+                let result = match &transition.condition {
+                    None => Ok(true),
+                    Some(key) => lua.call_condition(key),
+                };
+                match result {
                     Ok(true) => return transition.to,
                     Ok(false) => continue,
                     Err(err) => {
@@ -62,11 +67,10 @@ impl StateGraph {
     }
 }
 
-fn run_hook(lua: &LuaRuntime, code: &str) {
-    if code.is_empty() {
-        return;
-    }
-    if let Err(err) = lua.run(code) {
+fn run_hook(lua: &LuaRuntime, key: &Option<RegistryKey>) {
+    if let Some(k) = key
+        && let Err(err) = lua.run_hook(k)
+    {
         eprintln!("[lua hook error] {}", err);
     }
 }

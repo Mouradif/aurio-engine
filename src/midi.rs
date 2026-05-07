@@ -34,7 +34,7 @@ pub fn midi_to_freq(note: u8) -> f32 {
 }
 
 pub fn schedule_phrase(
-    targets: &Vec<usize>,
+    targets: &[usize],
     notes: &[MidiNote],
     duration_beats: f32,
     bpm: f32,
@@ -56,7 +56,7 @@ pub fn schedule_phrase(
         let off_sample = on_sample + (note.duration_beats * sample_per_beat) as u64;
 
         events.push(ScheduledEvent::new(
-            targets.clone(),
+            targets.to_vec(),
             on_sample,
             NoteEvent::NoteOn {
                 pitch: note.pitch,
@@ -64,7 +64,7 @@ pub fn schedule_phrase(
             },
         ));
         events.push(ScheduledEvent::new(
-            targets.clone(),
+            targets.to_vec(),
             off_sample.clamp(0, phrase_end),
             NoteEvent::NoteOff { pitch: note.pitch },
         ));

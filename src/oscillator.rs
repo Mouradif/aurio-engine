@@ -1,6 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub enum Wave {
     Sine,
     Square,

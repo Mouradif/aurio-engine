@@ -1,21 +1,18 @@
-use crate::{
-    midi::MidiNote,
-    phrase::Phrase,
-    scripting::{LuaRuntime, eval_or_empty},
-};
+use crate::{midi::MidiNote, phrase::Phrase, scripting::LuaRuntime};
+use mlua::RegistryKey;
 
 pub struct PhraseScript {
     pub name: String,
     pub duration_beats: f32,
-    pub code: String,
+    pub notes_fn: RegistryKey,
 }
 
 impl PhraseScript {
-    pub fn new(name: String, code: String, duration_beats: f32) -> Self {
+    pub fn new(name: String, duration_beats: f32, notes_fn: RegistryKey) -> Self {
         Self {
             name,
             duration_beats,
-            code,
+            notes_fn,
         }
     }
 }
@@ -30,6 +27,12 @@ impl Phrase for PhraseScript {
     }
 
     fn notes(&self, lua: &LuaRuntime) -> Vec<MidiNote> {
-        eval_or_empty(lua, &self.code)
+        match lua.call_notes(&self.notes_fn) {
+            Ok(notes) => notes,
+            Err(err) => {
+                eprintln!("[lua error] {}", err);
+                Vec::new()
+            }
+        }
     }
 }

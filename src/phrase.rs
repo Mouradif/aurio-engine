@@ -1,4 +1,5 @@
 use crate::{midi::MidiNote, scripting::LuaRuntime};
+use mlua::RegistryKey;
 
 pub trait Phrase {
     fn name(&self) -> &str;
@@ -8,11 +9,10 @@ pub trait Phrase {
     fn notes(&self, lua: &LuaRuntime) -> Vec<MidiNote>;
 }
 
-#[derive(Default, Clone)]
 pub struct PhraseHooks {
-    pub on_enter: String,
-    pub on_loop: String,
-    pub on_exit: String,
+    pub on_enter: Option<RegistryKey>,
+    pub on_loop: Option<RegistryKey>,
+    pub on_exit: Option<RegistryKey>,
 }
 
 pub struct PhraseEntry {

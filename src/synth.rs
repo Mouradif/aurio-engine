@@ -3,9 +3,7 @@ use crate::{
     midi::{NoteEvent, midi_to_freq},
     oscillator::{Oscillator, Wave},
 };
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ADSR {
     pub a: f32,
     pub d: f32,

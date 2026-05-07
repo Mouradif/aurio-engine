@@ -1,184 +1,417 @@
 use crate::audio_graph::{AudioGraph, AudioNode};
-use crate::effect::{Effect, Gain, Reverb};
+use crate::effect::{Gain, Reverb};
 use crate::midi::{MidiNote, ScheduledEvent};
 use crate::oscillator::{Oscillator, Wave};
-use crate::phrase::{PhraseEntry, PhraseHooks};
+use crate::phrase::{Phrase, PhraseEntry, PhraseHooks};
 use crate::phrase_script::PhraseScript;
-use crate::scripting::LuaRuntime;
+use crate::rtttl::parse_rtttl;
+use crate::scripting::{LuaRuntime, notes_from_table};
 use crate::state_graph::{StateGraph, run_timing_thread};
 use crate::static_phrase::StaticPhrase;
 use crate::synth::{ADSR, Synth};
 use crate::transition::Transition;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use mlua::{Function, Lua, RegistryKey, Table, Value};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Split};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-#[derive(Serialize, Deserialize)]
 pub struct Song {
-    pub bpm: f32,
-    pub instruments: Vec<InstrumentConfig>,
-    #[serde(default)]
-    pub effects: Vec<EffectEntry>,
-    #[serde(default)]
-    pub outputs: Vec<OutputEntry>,
-    #[serde(default)]
-    pub connections: Vec<Connection>,
-    pub tracks: Vec<TrackConfig>,
+    bpm: f32,
+    sockets: Vec<SocketEntry>,
+    labels: HashMap<String, u32>,
+    connections: Vec<(SocketRef, SocketRef)>,
+    phrases: HashMap<String, PhraseSpec>,
+    tracks: Vec<TrackSpec>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct OutputEntry {
-    pub name: String,
+struct SocketEntry {
+    id: u32,
+    content: SocketContent,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct InstrumentConfig {
-    pub id: usize,
-    pub adsr: ADSR,
-    pub oscillators: Vec<OscillatorConfig>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct OscillatorConfig {
-    pub wave: Wave,
-    pub gain: f32,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct EffectEntry {
-    pub name: String,
-    pub kind: EffectConfig,
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum EffectConfig {
-    Gain {
-        level: f32,
+enum SocketContent {
+    Instrument {
+        adsr: ADSR,
+        oscillators: Vec<(Wave, f32)>,
     },
-    Reverb {
-        delay_seconds: f32,
-        feedback: f32,
-        mix: f32,
-    },
+    Effect(EffectSpec),
+    Output,
 }
 
-#[derive(Serialize, Deserialize)]
-pub enum NodeRef {
-    Instrument(usize),
-    Effect(String),
-    Output(String),
+enum EffectSpec {
+    Gain { level: f32 },
+    Reverb { delay: f32, feedback: f32, mix: f32 },
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct Connection {
-    pub from: NodeRef,
-    pub to: NodeRef,
+enum SocketRef {
+    Id(u32),
+    Label(String),
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct TrackConfig {
-    pub targets: Vec<usize>,
-    #[serde(default)]
-    pub initial: usize,
-    pub patterns: Vec<PatternConfig>,
-    #[serde(default)]
-    pub transitions: Vec<TransitionConfig>,
+struct PhraseSpec {
+    duration_beats: f32,
+    notes_source: NotesSourceSpec,
+    on_enter: Option<RegistryKey>,
+    on_loop: Option<RegistryKey>,
+    on_exit: Option<RegistryKey>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub enum PatternConfig {
-    Notes {
-        name: String,
-        duration_beats: f32,
-        notes: Vec<MidiNoteConfig>,
-        #[serde(default)]
-        on_enter: String,
-        #[serde(default)]
-        on_loop: String,
-        #[serde(default)]
-        on_exit: String,
-    },
-    Rtttl {
-        name: String,
-        source: String,
-        #[serde(default)]
-        on_enter: String,
-        #[serde(default)]
-        on_loop: String,
-        #[serde(default)]
-        on_exit: String,
-    },
-    LuaOnce {
-        name: String,
-        duration_beats: f32,
-        code: String,
-        #[serde(default)]
-        on_enter: String,
-        #[serde(default)]
-        on_loop: String,
-        #[serde(default)]
-        on_exit: String,
-    },
-    Lua {
-        name: String,
-        duration_beats: f32,
-        code: String,
-        #[serde(default)]
-        on_enter: String,
-        #[serde(default)]
-        on_loop: String,
-        #[serde(default)]
-        on_exit: String,
-    },
+enum NotesSourceSpec {
+    Static(Vec<MidiNote>),
+    Dynamic(RegistryKey),
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct MidiNoteConfig {
-    pub pitch: u8,
-    pub velocity: u8,
-    pub start_beat: f32,
-    pub duration_beats: f32,
+struct TrackSpec {
+    targets: Vec<SocketRef>,
+    initial: String,
+    transitions: Vec<TransitionSpec>,
 }
 
-impl From<MidiNoteConfig> for MidiNote {
-    fn from(n: MidiNoteConfig) -> Self {
-        Self {
-            pitch: n.pitch,
-            velocity: n.velocity,
-            start_beat: n.start_beat,
-            duration_beats: n.duration_beats,
+struct TransitionSpec {
+    from: String,
+    to: String,
+    condition: Option<RegistryKey>,
+}
+
+#[derive(Default)]
+struct SongBuilder {
+    bpm: Option<f32>,
+    sockets: Vec<SocketEntry>,
+    labels: HashMap<String, u32>,
+    connections: Vec<(SocketRef, SocketRef)>,
+    phrases: HashMap<String, PhraseSpec>,
+    tracks: Vec<TrackSpec>,
+    socket_ids: HashSet<u32>,
+}
+
+impl SongBuilder {
+    fn add_socket(
+        &mut self,
+        id: u32,
+        content: SocketContent,
+        label: Option<String>,
+    ) -> mlua::Result<()> {
+        if !self.socket_ids.insert(id) {
+            return Err(mlua::Error::RuntimeError(format!(
+                "duplicate socket id: {}",
+                id
+            )));
         }
+        if let Some(l) = label
+            && self.labels.insert(l.clone(), id).is_some()
+        {
+            return Err(mlua::Error::RuntimeError(format!("duplicate label: {}", l)));
+        }
+        self.sockets.push(SocketEntry { id, content });
+        Ok(())
     }
 }
 
-fn default_condition() -> String {
-    "true".to_string()
+type SharedBuilder = Arc<Mutex<Option<SongBuilder>>>;
+
+fn parse_wave(name: &str) -> mlua::Result<Wave> {
+    match name {
+        "Sine" => Ok(Wave::Sine),
+        "Square" => Ok(Wave::Square),
+        "Saw" => Ok(Wave::Saw),
+        "Triangle" => Ok(Wave::Triangle),
+        "Noise" => Ok(Wave::Noise),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "unknown wave: {}",
+            other
+        ))),
+    }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct TransitionConfig {
-    pub from: usize,
-    pub to: usize,
-    #[serde(default = "default_condition")]
-    pub condition: String,
+fn parse_socket_ref(v: &Value) -> mlua::Result<SocketRef> {
+    match v {
+        Value::Integer(i) => Ok(SocketRef::Id(*i as u32)),
+        Value::Number(n) => Ok(SocketRef::Id(*n as u32)),
+        Value::String(s) => Ok(SocketRef::Label(s.to_str()?.to_string())),
+        _ => Err(mlua::Error::RuntimeError(
+            "expected socket id (integer) or label (string)".into(),
+        )),
+    }
+}
+
+fn label_from_opts(opts: Option<Table>) -> mlua::Result<Option<String>> {
+    match opts {
+        Some(t) => t.get::<Option<String>>("label"),
+        None => Ok(None),
+    }
+}
+
+fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::Result<()> {
+    {
+        let b = builder.clone();
+        song.set(
+            "bpm",
+            lua.create_function(move |_, (_self, bpm): (Value, f32)| {
+                b.lock().unwrap().as_mut().unwrap().bpm = Some(bpm);
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
+            "instrument",
+            lua.create_function(
+                move |_, (_self, id, config, opts): (Value, u32, Table, Option<Table>)| {
+                    let adsr_t: Table = config.get("adsr")?;
+                    let adsr = ADSR {
+                        a: adsr_t.get(1)?,
+                        d: adsr_t.get(2)?,
+                        s: adsr_t.get(3)?,
+                        r: adsr_t.get(4)?,
+                    };
+                    let osc_t: Table = config.get("oscillators")?;
+                    let mut oscillators = Vec::new();
+                    for v in osc_t.sequence_values::<Table>() {
+                        let osc = v?;
+                        let wave_str: String = osc.get("wave")?;
+                        let wave = parse_wave(&wave_str)?;
+                        let gain: f32 = osc.get("gain")?;
+                        oscillators.push((wave, gain));
+                    }
+                    let label = label_from_opts(opts)?;
+                    b.lock().unwrap().as_mut().unwrap().add_socket(
+                        id,
+                        SocketContent::Instrument { adsr, oscillators },
+                        label,
+                    )?;
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
+            "effect",
+            lua.create_function(
+                move |_,
+                      (_self, id, kind, params, opts): (
+                    Value,
+                    u32,
+                    String,
+                    Table,
+                    Option<Table>,
+                )| {
+                    let spec = match kind.as_str() {
+                        "Gain" => EffectSpec::Gain {
+                            level: params.get("level")?,
+                        },
+                        "Reverb" => EffectSpec::Reverb {
+                            delay: params.get("delay")?,
+                            feedback: params.get("feedback")?,
+                            mix: params.get("mix")?,
+                        },
+                        other => {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "unknown effect: {}",
+                                other
+                            )));
+                        }
+                    };
+                    let label = label_from_opts(opts)?;
+                    b.lock().unwrap().as_mut().unwrap().add_socket(
+                        id,
+                        SocketContent::Effect(spec),
+                        label,
+                    )?;
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
+            "output",
+            lua.create_function(move |_, (_self, id, opts): (Value, u32, Option<Table>)| {
+                let label = label_from_opts(opts)?;
+                b.lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .add_socket(id, SocketContent::Output, label)?;
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
+            "connection",
+            lua.create_function(move |_, (_self, from, to): (Value, Value, Value)| {
+                let from_ref = parse_socket_ref(&from)?;
+                let to_ref = parse_socket_ref(&to)?;
+                b.lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .connections
+                    .push((from_ref, to_ref));
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
+            "phrase",
+            lua.create_function(
+                move |inner_lua, (_self, name, opts): (Value, String, Table)| {
+                    let rtttl_value: Value = opts.get("rtttl").unwrap_or(Value::Nil);
+                    let notes_value: Value = opts.get("notes").unwrap_or(Value::Nil);
+
+                    let (notes_source, duration_beats) = if let Value::String(s) = rtttl_value {
+                        let rtttl_str = s.to_str()?.to_string();
+                        let (duration, notes) = parse_rtttl(&rtttl_str);
+                        (NotesSourceSpec::Static(notes), duration)
+                    } else {
+                        let duration: f32 = opts.get("duration")?;
+                        match notes_value {
+                            Value::Table(t) => {
+                                let notes = notes_from_table(&t)?;
+                                (NotesSourceSpec::Static(notes), duration)
+                            }
+                            Value::Function(f) => {
+                                let key = inner_lua.create_registry_value(f)?;
+                                (NotesSourceSpec::Dynamic(key), duration)
+                            }
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(format!(
+                                    "phrase '{}' must have notes (table or function) or rtttl",
+                                    name
+                                )));
+                            }
+                        }
+                    };
+
+                    let on_enter = opts
+                        .get::<Option<Function>>("on_enter")?
+                        .map(|f| inner_lua.create_registry_value(f))
+                        .transpose()?;
+                    let on_loop = opts
+                        .get::<Option<Function>>("on_loop")?
+                        .map(|f| inner_lua.create_registry_value(f))
+                        .transpose()?;
+                    let on_exit = opts
+                        .get::<Option<Function>>("on_exit")?
+                        .map(|f| inner_lua.create_registry_value(f))
+                        .transpose()?;
+
+                    let mut bg = b.lock().unwrap();
+                    let bs = bg.as_mut().unwrap();
+                    if bs.phrases.contains_key(&name) {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "duplicate phrase name: {}",
+                            name
+                        )));
+                    }
+                    bs.phrases.insert(
+                        name,
+                        PhraseSpec {
+                            duration_beats,
+                            notes_source,
+                            on_enter,
+                            on_loop,
+                            on_exit,
+                        },
+                    );
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
+            "track",
+            lua.create_function(move |inner_lua, (_self, opts): (Value, Table)| {
+                let targets_t: Table = opts.get("targets")?;
+                let mut targets = Vec::new();
+                for v in targets_t.sequence_values::<Value>() {
+                    targets.push(parse_socket_ref(&v?)?);
+                }
+
+                let initial: String = opts.get("initial")?;
+
+                let transitions_t: Option<Table> = opts.get("transitions")?;
+                let mut transitions = Vec::new();
+                if let Some(tt) = transitions_t {
+                    for v in tt.sequence_values::<Table>() {
+                        let t = v?;
+                        let from: String = t.get("from")?;
+                        let to: String = t.get("to")?;
+                        let condition_fn: Option<Function> = t.get("condition")?;
+                        let condition = condition_fn
+                            .map(|f| inner_lua.create_registry_value(f))
+                            .transpose()?;
+                        transitions.push(TransitionSpec {
+                            from,
+                            to,
+                            condition,
+                        });
+                    }
+                }
+
+                b.lock().unwrap().as_mut().unwrap().tracks.push(TrackSpec {
+                    targets,
+                    initial,
+                    transitions,
+                });
+                Ok(())
+            })?,
+        )?;
+    }
+
+    Ok(())
 }
 
 impl Song {
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let contents = fs::read_to_string(path)?;
-        let song: Song = ron::from_str(&contents)?;
-        Ok(song)
+    pub fn load<P: AsRef<Path>>(
+        path: P,
+        lua: &LuaRuntime,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let builder: SharedBuilder = Arc::new(Mutex::new(Some(SongBuilder::default())));
+        let song_table = lua.lua().create_table()?;
+        register_methods(lua.lua(), &song_table, &builder)?;
+        lua.lua().globals().set("song", song_table)?;
+
+        let code = std::fs::read_to_string(path.as_ref())?;
+        let chunk_name = path.as_ref().display().to_string();
+        lua.lua().load(&code).set_name(chunk_name).exec()?;
+
+        let state = builder
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or("song builder was already taken")?;
+
+        Ok(Song {
+            bpm: state.bpm.unwrap_or(120.0),
+            sockets: state.sockets,
+            labels: state.labels,
+            connections: state.connections,
+            phrases: state.phrases,
+            tracks: state.tracks,
+        })
     }
 
-    pub fn play(self) -> ! {
-        let lua = LuaRuntime::new();
-
+    pub fn play(self, lua: LuaRuntime) -> ! {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -190,89 +423,109 @@ impl Song {
         println!("Audio: {} Hz, {} channels", sample_rate, channels);
         println!("Playing at {} BPM...", self.bpm);
 
+        let Song {
+            bpm,
+            sockets,
+            labels,
+            connections,
+            phrases,
+            tracks,
+        } = self;
+
         let mut audio_nodes: Vec<AudioNode> = Vec::new();
-        let mut instrument_idx: HashMap<usize, usize> = HashMap::new();
-        let mut effect_idx: HashMap<String, usize> = HashMap::new();
+        let mut socket_to_node: HashMap<u32, usize> = HashMap::new();
 
-        for instrument in self.instruments {
-            let oscillators: Vec<(Oscillator, f32)> = instrument
-                .oscillators
-                .into_iter()
-                .map(|o| (Oscillator::new(o.wave), o.gain))
-                .collect();
-            let synth = Synth::new(instrument.id, instrument.adsr, oscillators);
-            let idx = audio_nodes.len();
-            audio_nodes.push(AudioNode::Source(Box::new(synth)));
-            if instrument_idx.insert(instrument.id, idx).is_some() {
-                panic!("Duplicate instrument id: {}", instrument.id);
-            }
-        }
-
-        for entry in self.effects {
-            let effect: Box<dyn Effect + Send> = match entry.kind {
-                EffectConfig::Gain { level } => Box::new(Gain::new(level)),
-                EffectConfig::Reverb {
-                    delay_seconds,
+        for socket in sockets {
+            let node = match socket.content {
+                SocketContent::Instrument { adsr, oscillators } => {
+                    let oscillators: Vec<(Oscillator, f32)> = oscillators
+                        .into_iter()
+                        .map(|(wave, gain)| (Oscillator::new(wave), gain))
+                        .collect();
+                    let synth = Synth::new(socket.id as usize, adsr, oscillators);
+                    AudioNode::Source(Box::new(synth))
+                }
+                SocketContent::Effect(EffectSpec::Gain { level }) => {
+                    AudioNode::Processor(Box::new(Gain::new(level)))
+                }
+                SocketContent::Effect(EffectSpec::Reverb {
+                    delay,
                     feedback,
                     mix,
-                } => Box::new(Reverb::new(delay_seconds, feedback, mix, sample_rate)),
+                }) => {
+                    AudioNode::Processor(Box::new(Reverb::new(delay, feedback, mix, sample_rate)))
+                }
+                SocketContent::Output => AudioNode::Output,
             };
             let idx = audio_nodes.len();
-            audio_nodes.push(AudioNode::Processor(effect));
-            if effect_idx.insert(entry.name.clone(), idx).is_some() {
-                panic!("Duplicate effect name: {}", entry.name);
-            }
+            audio_nodes.push(node);
+            socket_to_node.insert(socket.id, idx);
         }
 
-        let mut output_idx: HashMap<String, usize> = HashMap::new();
-        for entry in self.outputs {
-            let idx = audio_nodes.len();
-            audio_nodes.push(AudioNode::Output);
-            if output_idx.insert(entry.name.clone(), idx).is_some() {
-                panic!("Duplicate output name: {}", entry.name);
-            }
-        }
-
-        let resolve = |r: &NodeRef| -> usize {
+        let resolve_socket_id = |r: &SocketRef| -> u32 {
             match r {
-                NodeRef::Instrument(id) => *instrument_idx
-                    .get(id)
-                    .unwrap_or_else(|| panic!("Unknown instrument id in routing: {}", id)),
-                NodeRef::Effect(name) => *effect_idx
+                SocketRef::Id(i) => *i,
+                SocketRef::Label(name) => *labels
                     .get(name)
-                    .unwrap_or_else(|| panic!("Unknown effect name in routing: {}", name)),
-                NodeRef::Output(name) => *output_idx
-                    .get(name)
-                    .unwrap_or_else(|| panic!("Unknown output name in routing: {}", name)),
+                    .unwrap_or_else(|| panic!("unknown label: {}", name)),
             }
         };
 
-        let audio_edges: Vec<(usize, usize)> = self
-            .connections
+        let resolve_node = |r: &SocketRef| -> usize {
+            let id = resolve_socket_id(r);
+            *socket_to_node
+                .get(&id)
+                .unwrap_or_else(|| panic!("unknown socket id: {}", id))
+        };
+
+        let audio_edges: Vec<(usize, usize)> = connections
             .iter()
-            .map(|c| (resolve(&c.from), resolve(&c.to)))
+            .map(|(f, t)| (resolve_node(f), resolve_node(t)))
             .collect();
 
-        let mut audio_graph = AudioGraph::new(audio_nodes, audio_edges)
-            .expect("Failed to build audio graph");
+        let mut audio_graph =
+            AudioGraph::new(audio_nodes, audio_edges).expect("Failed to build audio graph");
 
-        let mut state_graphs: Vec<StateGraph> = Vec::with_capacity(self.tracks.len());
-        for track in self.tracks {
-            let phrases: Vec<PhraseEntry> = track
-                .patterns
-                .into_iter()
-                .map(|p| build_phrase_entry(p, &lua))
+        let mut state_graphs: Vec<StateGraph> = Vec::with_capacity(tracks.len());
+        for track in tracks {
+            let track_targets: Vec<usize> = track
+                .targets
+                .iter()
+                .map(|r| resolve_socket_id(r) as usize)
                 .collect();
-            let transitions: Vec<Transition> = track
-                .transitions
-                .into_iter()
-                .map(|t| Transition::new(t.from, t.to, t.condition))
-                .collect();
+
+            let mut phrase_indices: HashMap<String, usize> = HashMap::new();
+            let mut phrase_entries: Vec<PhraseEntry> = Vec::new();
+
+            let mut ensure = |name: &str| -> Result<usize, String> {
+                if let Some(&idx) = phrase_indices.get(name) {
+                    return Ok(idx);
+                }
+                let spec = phrases
+                    .get(name)
+                    .ok_or_else(|| format!("unknown phrase: {}", name))?;
+                let entry = build_phrase_entry(name, spec, lua.lua())
+                    .map_err(|e| format!("building phrase '{}': {}", name, e))?;
+                let idx = phrase_entries.len();
+                phrase_entries.push(entry);
+                phrase_indices.insert(name.to_string(), idx);
+                Ok(idx)
+            };
+
+            let initial_idx = ensure(&track.initial).expect("track initial phrase");
+
+            let mut runtime_transitions = Vec::new();
+            for ts in track.transitions {
+                let from_idx = ensure(&ts.from).expect("transition from phrase");
+                let to_idx = ensure(&ts.to).expect("transition to phrase");
+                runtime_transitions.push(Transition::new(from_idx, to_idx, ts.condition));
+            }
+
             state_graphs.push(StateGraph::new(
-                track.targets,
-                phrases,
-                transitions,
-                track.initial,
+                track_targets,
+                phrase_entries,
+                runtime_transitions,
+                initial_idx,
             ));
         }
 
@@ -282,7 +535,6 @@ impl Song {
         let sample_counter = Arc::new(AtomicU64::new(0));
         let audio_counter = sample_counter.clone();
         let timing_counter = sample_counter.clone();
-        let bpm = self.bpm;
 
         std::thread::spawn(move || {
             run_timing_thread(
@@ -307,7 +559,7 @@ impl Song {
                     for frame in 0..num_frames {
                         let frame_sample = current + frame as u64;
 
-                        while consumer.first().map_or(false, |e| e.sample <= frame_sample) {
+                        while consumer.first().is_some_and(|e| e.sample <= frame_sample) {
                             let event = consumer.try_pop().unwrap();
                             audio_graph.process_event(&event);
                         }
@@ -333,69 +585,47 @@ impl Song {
     }
 }
 
-fn build_phrase_entry(p: PatternConfig, lua: &LuaRuntime) -> PhraseEntry {
-    match p {
-        PatternConfig::Notes {
-            name,
-            duration_beats,
-            notes,
-            on_enter,
-            on_loop,
-            on_exit,
-        } => {
-            let notes: Vec<MidiNote> = notes.into_iter().map(Into::into).collect();
-            PhraseEntry {
-                phrase: Box::new(StaticPhrase::new(name, notes, duration_beats)),
-                hooks: PhraseHooks {
-                    on_enter,
-                    on_loop,
-                    on_exit,
-                },
-            }
+fn build_phrase_entry(
+    name: &str,
+    spec: &PhraseSpec,
+    lua: &Lua,
+) -> Result<PhraseEntry, mlua::Error> {
+    let phrase: Box<dyn Phrase + Send> = match &spec.notes_source {
+        NotesSourceSpec::Static(notes) => Box::new(StaticPhrase::new(
+            name.to_string(),
+            notes.clone(),
+            spec.duration_beats,
+        )),
+        NotesSourceSpec::Dynamic(key) => {
+            let new_key = clone_registry_key(lua, key)?;
+            Box::new(PhraseScript::new(
+                name.to_string(),
+                spec.duration_beats,
+                new_key,
+            ))
         }
-        PatternConfig::Rtttl {
-            name,
-            source,
-            on_enter,
-            on_loop,
-            on_exit,
-        } => PhraseEntry {
-            phrase: Box::new(StaticPhrase::from_rtttl(name, &source)),
-            hooks: PhraseHooks {
-                on_enter,
-                on_loop,
-                on_exit,
-            },
-        },
-        PatternConfig::LuaOnce {
-            name,
-            duration_beats,
-            code,
-            on_enter,
-            on_loop,
-            on_exit,
-        } => PhraseEntry {
-            phrase: Box::new(StaticPhrase::from_lua(lua, name, code, duration_beats)),
-            hooks: PhraseHooks {
-                on_enter,
-                on_loop,
-                on_exit,
-            },
-        },
-        PatternConfig::Lua {
-            name,
-            duration_beats,
-            code,
-            on_enter,
-            on_loop,
-            on_exit,
-        } => PhraseEntry {
-            phrase: Box::new(PhraseScript::new(name, code, duration_beats)),
-            hooks: PhraseHooks {
-                on_enter,
-                on_loop,
-                on_exit,
-            },
-        },
+    };
+
+    let hooks = PhraseHooks {
+        on_enter: clone_optional_key(lua, &spec.on_enter)?,
+        on_loop: clone_optional_key(lua, &spec.on_loop)?,
+        on_exit: clone_optional_key(lua, &spec.on_exit)?,
+    };
+
+    Ok(PhraseEntry { phrase, hooks })
+}
+
+fn clone_registry_key(lua: &Lua, key: &RegistryKey) -> Result<RegistryKey, mlua::Error> {
+    let f: Function = lua.registry_value(key)?;
+    lua.create_registry_value(f)
+}
+
+fn clone_optional_key(
+    lua: &Lua,
+    key: &Option<RegistryKey>,
+) -> Result<Option<RegistryKey>, mlua::Error> {
+    match key {
+        Some(k) => Ok(Some(clone_registry_key(lua, k)?)),
+        None => Ok(None),
     }
 }

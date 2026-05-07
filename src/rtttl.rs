@@ -16,7 +16,7 @@ pub fn parse_rtttl(rtttl: &str) -> (f32, Vec<MidiNote>) {
     (beat, notes)
 }
 
-pub fn parse_rtttl_note(word: &str, beat: f32) -> Option<MidiNote> {
+fn parse_rtttl_note(word: &str, beat: f32) -> Option<MidiNote> {
     let mut chars = word.char_indices().peekable();
 
     let start = 0;
