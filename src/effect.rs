@@ -1,20 +1,63 @@
+/// Audio-thread effect node. `process` runs once per sample; `set_param`
+/// applies a live parameter update (default no-op for effects without
+/// controllable params).
 pub trait Effect {
     fn process(&mut self, sample: f32) -> f32;
+    fn set_param(&mut self, _idx: u8, _value: f32) {}
+}
+
+/// One-pole low-pass smoother for parameter values. Avoids zipper noise
+/// when a target value jumps (e.g. on each MIDI CC tick).
+pub struct Smoothed {
+    target: f32,
+    current: f32,
+    coeff: f32,
+}
+
+impl Smoothed {
+    pub fn new(initial: f32, time_constant_seconds: f32, sample_rate: f32) -> Self {
+        let tau = time_constant_seconds.max(1e-6);
+        let coeff = 1.0 - (-1.0 / (tau * sample_rate)).exp();
+        Self {
+            target: initial,
+            current: initial,
+            coeff,
+        }
+    }
+
+    pub fn set_target(&mut self, value: f32) {
+        self.target = value;
+    }
+
+    pub fn next(&mut self) -> f32 {
+        self.current += self.coeff * (self.target - self.current);
+        self.current
+    }
 }
 
 pub struct Gain {
-    pub level: f32,
+    level: Smoothed,
 }
 
 impl Gain {
-    pub fn new(level: f32) -> Self {
-        Self { level }
+    pub const PARAM_LEVEL: u8 = 0;
+
+    pub fn new(level: f32, sample_rate: f32) -> Self {
+        Self {
+            level: Smoothed::new(level, 0.01, sample_rate),
+        }
     }
 }
 
 impl Effect for Gain {
     fn process(&mut self, sample: f32) -> f32 {
-        sample * self.level
+        sample * self.level.next()
+    }
+
+    fn set_param(&mut self, idx: u8, value: f32) {
+        if idx == Self::PARAM_LEVEL {
+            self.level.set_target(value);
+        }
     }
 }
 
@@ -104,23 +147,36 @@ impl Effect for Highpass {
 }
 
 pub struct Distortion {
-    drive: f32,
-    mix: f32,
+    drive: Smoothed,
+    mix: Smoothed,
 }
 
 impl Distortion {
-    pub fn new(drive: f32, mix: f32) -> Self {
+    pub const PARAM_DRIVE: u8 = 0;
+    pub const PARAM_MIX: u8 = 1;
+
+    pub fn new(drive: f32, mix: f32, sample_rate: f32) -> Self {
         Self {
-            drive: drive.max(0.0),
-            mix: mix.clamp(0.0, 1.0),
+            drive: Smoothed::new(drive.max(0.0), 0.01, sample_rate),
+            mix: Smoothed::new(mix.clamp(0.0, 1.0), 0.01, sample_rate),
         }
     }
 }
 
 impl Effect for Distortion {
     fn process(&mut self, sample: f32) -> f32 {
-        let wet = (sample * self.drive).tanh();
-        sample * (1.0 - self.mix) + wet * self.mix
+        let drive = self.drive.next();
+        let mix = self.mix.next();
+        let wet = (sample * drive).tanh();
+        sample * (1.0 - mix) + wet * mix
+    }
+
+    fn set_param(&mut self, idx: u8, value: f32) {
+        match idx {
+            Self::PARAM_DRIVE => self.drive.set_target(value.max(0.0)),
+            Self::PARAM_MIX => self.mix.set_target(value.clamp(0.0, 1.0)),
+            _ => {}
+        }
     }
 }
 

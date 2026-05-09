@@ -12,19 +12,44 @@ pub enum NoteEvent {
     NoteOff { pitch: u8 },
 }
 
+/// What a `ScheduledEvent` actually does at its sample. Notes route to
+/// instrument sources by id; param updates route to a specific processor
+/// node by its pre-resolved index in the audio graph.
+#[derive(Clone, Debug)]
+pub enum EventKind {
+    Note {
+        targets: Vec<usize>,
+        event: NoteEvent,
+    },
+    SetParam {
+        node_idx: usize,
+        param_idx: u8,
+        value: f32,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct ScheduledEvent {
-    pub targets: Vec<usize>,
     pub sample: u64,
-    pub event: NoteEvent,
+    pub kind: EventKind,
 }
 
 impl ScheduledEvent {
-    pub fn new(targets: Vec<usize>, sample: u64, event: NoteEvent) -> Self {
+    pub fn note(targets: Vec<usize>, sample: u64, event: NoteEvent) -> Self {
         Self {
-            targets,
             sample,
-            event,
+            kind: EventKind::Note { targets, event },
+        }
+    }
+
+    pub fn set_param(sample: u64, node_idx: usize, param_idx: u8, value: f32) -> Self {
+        Self {
+            sample,
+            kind: EventKind::SetParam {
+                node_idx,
+                param_idx,
+                value,
+            },
         }
     }
 }
@@ -55,7 +80,7 @@ pub fn schedule_phrase(
 
         let off_sample = on_sample + (note.duration_beats * sample_per_beat) as u64;
 
-        events.push(ScheduledEvent::new(
+        events.push(ScheduledEvent::note(
             targets.to_vec(),
             on_sample,
             NoteEvent::NoteOn {
@@ -63,7 +88,7 @@ pub fn schedule_phrase(
                 velocity: note.velocity,
             },
         ));
-        events.push(ScheduledEvent::new(
+        events.push(ScheduledEvent::note(
             targets.to_vec(),
             off_sample.clamp(0, phrase_end),
             NoteEvent::NoteOff { pitch: note.pitch },

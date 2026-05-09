@@ -11,9 +11,9 @@ use crate::static_phrase::StaticPhrase;
 use crate::synth::{ADSR, Synth};
 use crate::transition::Transition;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use mlua::{Function, Lua, RegistryKey, Table, Value};
-use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Split};
+use mlua::{Function, Lua, RegistryKey, Table, UserData, Value};
+use ringbuf::{HeapProd, HeapRb};
+use ringbuf::traits::{Consumer, Producer, Split};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +26,7 @@ pub struct Song {
     connections: Vec<(SocketRef, SocketRef)>,
     phrases: HashMap<String, PhraseSpec>,
     tracks: Vec<TrackSpec>,
+    pending_bindings: Vec<PendingBinding>,
 }
 
 struct SocketEntry {
@@ -82,6 +83,40 @@ struct TransitionSpec {
     condition: Option<RegistryKey>,
 }
 
+/// Lua handle returned by `midi_connect(...)`. Carries the binding spec
+/// only — the actual atomic exchange happens through the param ringbuf
+/// once the MIDI thread is spawned.
+#[derive(Clone)]
+pub struct LiveParam {
+    pub cc: u8,
+    pub channel: Option<u8>, // None = match any channel
+    pub initial: f32,
+    pub range: (f32, f32),
+}
+
+impl UserData for LiveParam {}
+
+/// A `LiveParam` reference attached to an effect's named param at lua-eval
+/// time. Resolved into a `ResolvedBinding` once the audio graph is built
+/// and node indices are known.
+#[derive(Clone)]
+struct PendingBinding {
+    cc: u8,
+    channel: Option<u8>,
+    range: (f32, f32),
+    socket_id: u32,
+    param_idx: u8,
+}
+
+#[derive(Clone)]
+struct ResolvedBinding {
+    cc: u8,
+    channel: Option<u8>,
+    range: (f32, f32),
+    node_idx: usize,
+    param_idx: u8,
+}
+
 #[derive(Default)]
 struct SongBuilder {
     bpm: Option<f32>,
@@ -91,6 +126,7 @@ struct SongBuilder {
     phrases: HashMap<String, PhraseSpec>,
     tracks: Vec<TrackSpec>,
     socket_ids: HashSet<u32>,
+    pending_bindings: Vec<PendingBinding>,
 }
 
 impl SongBuilder {
@@ -147,6 +183,95 @@ fn label_from_opts(opts: Option<Table>) -> mlua::Result<Option<String>> {
     match opts {
         Some(t) => t.get::<Option<String>>("label"),
         None => Ok(None),
+    }
+}
+
+/// Parse a MIDI binding spec string: `"cc<N>"` or `"cc<N>:ch<M>"`.
+/// Channels are 1-indexed in the spec, stored 0-indexed internally.
+fn parse_midi_spec(s: &str) -> mlua::Result<(u8, Option<u8>)> {
+    let s = s.trim().to_lowercase();
+    let parts: Vec<&str> = s.split(':').map(str::trim).collect();
+    let cc_part = parts[0];
+    if !cc_part.starts_with("cc") {
+        return Err(mlua::Error::RuntimeError(format!(
+            "midi spec must start with 'cc': {}",
+            s
+        )));
+    }
+    let cc: u8 = cc_part[2..]
+        .parse()
+        .map_err(|_| mlua::Error::RuntimeError(format!("invalid cc number: {}", cc_part)))?;
+    if cc > 127 {
+        return Err(mlua::Error::RuntimeError(format!(
+            "cc must be 0..=127: {}",
+            cc
+        )));
+    }
+
+    let channel = if parts.len() > 1 {
+        let ch_part = parts[1];
+        if !ch_part.starts_with("ch") {
+            return Err(mlua::Error::RuntimeError(format!(
+                "channel spec must start with 'ch': {}",
+                ch_part
+            )));
+        }
+        let ch: u8 = ch_part[2..]
+            .parse()
+            .map_err(|_| mlua::Error::RuntimeError(format!("invalid channel: {}", ch_part)))?;
+        if !(1..=16).contains(&ch) {
+            return Err(mlua::Error::RuntimeError(format!(
+                "channel must be 1..=16: {}",
+                ch
+            )));
+        }
+        Some(ch - 1)
+    } else {
+        None
+    };
+
+    Ok((cc, channel))
+}
+
+/// Pull a numeric param out of a Lua params table, or — if it's a
+/// `LiveParam` userdata — record a pending MIDI binding and return its
+/// initial value. The binding is later resolved to a node index in
+/// `Song::play`.
+fn extract_param(
+    params: &Table,
+    name: &str,
+    socket_id: u32,
+    param_idx: u8,
+    builder: &mut SongBuilder,
+) -> mlua::Result<f32> {
+    let v: Value = params.get(name)?;
+    match v {
+        Value::Number(n) => Ok(n as f32),
+        Value::Integer(i) => Ok(i as f32),
+        Value::UserData(ud) => {
+            let live = ud.borrow::<LiveParam>().map_err(|_| {
+                mlua::Error::RuntimeError(format!(
+                    "'{}' has unknown userdata type (expected LiveParam from midi_connect)",
+                    name
+                ))
+            })?;
+            builder.pending_bindings.push(PendingBinding {
+                cc: live.cc,
+                channel: live.channel,
+                range: live.range,
+                socket_id,
+                param_idx,
+            });
+            Ok(live.initial)
+        }
+        Value::Nil => Err(mlua::Error::RuntimeError(format!(
+            "missing param: '{}'",
+            name
+        ))),
+        _ => Err(mlua::Error::RuntimeError(format!(
+            "'{}' must be a number or a midi_connect handle",
+            name
+        ))),
     }
 }
 
@@ -209,10 +334,16 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                     Table,
                     Option<Table>,
                 )| {
+                    let label = label_from_opts(opts)?;
+                    let mut guard = b.lock().unwrap();
+                    let builder = guard.as_mut().unwrap();
+
                     let spec = match kind.as_str() {
-                        "Gain" => EffectSpec::Gain {
-                            level: params.get("level")?,
-                        },
+                        "Gain" => {
+                            let level =
+                                extract_param(&params, "level", id, Gain::PARAM_LEVEL, builder)?;
+                            EffectSpec::Gain { level }
+                        }
                         "Reverb" => EffectSpec::Reverb {
                             delay: params.get("delay")?,
                             feedback: params.get("feedback")?,
@@ -224,10 +355,23 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                         "Highpass" => EffectSpec::Highpass {
                             cutoff: params.get("cutoff")?,
                         },
-                        "Distortion" => EffectSpec::Distortion {
-                            drive: params.get("drive")?,
-                            mix: params.get("mix")?,
-                        },
+                        "Distortion" => {
+                            let drive = extract_param(
+                                &params,
+                                "drive",
+                                id,
+                                Distortion::PARAM_DRIVE,
+                                builder,
+                            )?;
+                            let mix = extract_param(
+                                &params,
+                                "mix",
+                                id,
+                                Distortion::PARAM_MIX,
+                                builder,
+                            )?;
+                            EffectSpec::Distortion { drive, mix }
+                        }
                         "Tremolo" => EffectSpec::Tremolo {
                             rate: params.get("rate")?,
                             depth: params.get("depth")?,
@@ -242,12 +386,7 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                             )));
                         }
                     };
-                    let label = label_from_opts(opts)?;
-                    b.lock().unwrap().as_mut().unwrap().add_socket(
-                        id,
-                        SocketContent::Effect(spec),
-                        label,
-                    )?;
+                    builder.add_socket(id, SocketContent::Effect(spec), label)?;
                     Ok(())
                 },
             )?,
@@ -413,6 +552,55 @@ impl Song {
         register_methods(lua.lua(), &song_table, &builder)?;
         lua.lua().globals().set("song", song_table)?;
 
+        // Global helper: midi_connect("cc<N>") | midi_connect{ cc=N, ... }
+        // Returns a LiveParam userdata that effect param parsers recognize.
+        let midi_connect = lua.lua().create_function(|_, arg: Value| match arg {
+            Value::String(s) => {
+                let (cc, channel) = parse_midi_spec(&s.to_str()?)?;
+                Ok(LiveParam {
+                    cc,
+                    channel,
+                    initial: 0.0,
+                    range: (0.0, 1.0),
+                })
+            }
+            Value::Table(t) => {
+                let cc: u8 = t.get("cc")?;
+                if cc > 127 {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "cc must be 0..=127: {}",
+                        cc
+                    )));
+                }
+                let channel = t.get::<Option<u8>>("channel")?;
+                let channel = match channel {
+                    None => None,
+                    Some(c) if (1..=16).contains(&c) => Some(c - 1),
+                    Some(c) => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "channel must be 1..=16: {}",
+                            c
+                        )));
+                    }
+                };
+                let initial: f32 = t.get::<Option<f32>>("initial")?.unwrap_or(0.0);
+                let range = match t.get::<Option<Table>>("range")? {
+                    Some(rt) => (rt.get(1)?, rt.get(2)?),
+                    None => (0.0, 1.0),
+                };
+                Ok(LiveParam {
+                    cc,
+                    channel,
+                    initial,
+                    range,
+                })
+            }
+            _ => Err(mlua::Error::RuntimeError(
+                "midi_connect expects a string spec or a table".into(),
+            )),
+        })?;
+        lua.lua().globals().set("midi_connect", midi_connect)?;
+
         let code = std::fs::read_to_string(path.as_ref())?;
         let chunk_name = path.as_ref().display().to_string();
 
@@ -446,6 +634,7 @@ impl Song {
             connections: state.connections,
             phrases: state.phrases,
             tracks: state.tracks,
+            pending_bindings: state.pending_bindings,
         })
     }
 
@@ -468,6 +657,7 @@ impl Song {
             connections,
             phrases,
             tracks,
+            pending_bindings,
         } = self;
 
         let mut audio_nodes: Vec<AudioNode> = Vec::new();
@@ -484,7 +674,7 @@ impl Song {
                     AudioNode::Source(Box::new(synth))
                 }
                 SocketContent::Effect(EffectSpec::Gain { level }) => {
-                    AudioNode::Processor(Box::new(Gain::new(level)))
+                    AudioNode::Processor(Box::new(Gain::new(level, sample_rate)))
                 }
                 SocketContent::Effect(EffectSpec::Reverb {
                     delay,
@@ -500,7 +690,7 @@ impl Song {
                     AudioNode::Processor(Box::new(Highpass::new(cutoff, sample_rate)))
                 }
                 SocketContent::Effect(EffectSpec::Distortion { drive, mix }) => {
-                    AudioNode::Processor(Box::new(Distortion::new(drive, mix)))
+                    AudioNode::Processor(Box::new(Distortion::new(drive, mix, sample_rate)))
                 }
                 SocketContent::Effect(EffectSpec::Tremolo { rate, depth }) => {
                     AudioNode::Processor(Box::new(Tremolo::new(rate, depth, sample_rate)))
@@ -582,8 +772,31 @@ impl Song {
             ));
         }
 
-        let ring_buffer = HeapRb::<ScheduledEvent>::new(4096);
-        let (producer, mut consumer) = ring_buffer.split();
+        // Resolve every pending MIDI binding now that node indices are known.
+        let resolved_bindings: Vec<ResolvedBinding> = pending_bindings
+            .into_iter()
+            .filter_map(|b| {
+                socket_to_node
+                    .get(&b.socket_id)
+                    .map(|&node_idx| ResolvedBinding {
+                        cc: b.cc,
+                        channel: b.channel,
+                        range: b.range,
+                        node_idx,
+                        param_idx: b.param_idx,
+                    })
+            })
+            .collect();
+
+        // Two ring buffers feed the audio thread:
+        //   notes_rb  — produced by the timing thread
+        //   params_rb — produced by the MIDI input thread (if any bindings exist)
+        // Both are SPSC; consumed in order by the audio callback per frame.
+        let notes_rb = HeapRb::<ScheduledEvent>::new(4096);
+        let (notes_producer, mut notes_consumer) = notes_rb.split();
+
+        let params_rb = HeapRb::<ScheduledEvent>::new(256);
+        let (params_producer, mut params_consumer) = params_rb.split();
 
         let sample_counter = Arc::new(AtomicU64::new(0));
         let audio_counter = sample_counter.clone();
@@ -593,12 +806,16 @@ impl Song {
             run_timing_thread(
                 &lua,
                 state_graphs,
-                producer,
+                notes_producer,
                 timing_counter,
                 bpm,
                 sample_rate,
             );
         });
+
+        if !resolved_bindings.is_empty() {
+            spawn_midi_thread(resolved_bindings, params_producer, sample_counter.clone());
+        }
 
         let cpal_config: cpal::StreamConfig = stream_config.into();
 
@@ -612,8 +829,18 @@ impl Song {
                     for frame in 0..num_frames {
                         let frame_sample = current + frame as u64;
 
-                        while consumer.first().is_some_and(|e| e.sample <= frame_sample) {
-                            let event = consumer.try_pop().unwrap();
+                        while notes_consumer
+                            .first()
+                            .is_some_and(|e| e.sample <= frame_sample)
+                        {
+                            let event = notes_consumer.try_pop().unwrap();
+                            audio_graph.process_event(&event);
+                        }
+                        while params_consumer
+                            .first()
+                            .is_some_and(|e| e.sample <= frame_sample)
+                        {
+                            let event = params_consumer.try_pop().unwrap();
                             audio_graph.process_event(&event);
                         }
 
@@ -636,6 +863,75 @@ impl Song {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
+}
+
+/// Spawn a thread that opens the first available MIDI input port and pushes
+/// `SetParam` events into the audio thread's params ringbuf whenever a
+/// matching CC message arrives. The thread parks forever to keep the
+/// `MidiInputConnection` (and its callback closure) alive.
+fn spawn_midi_thread(
+    bindings: Vec<ResolvedBinding>,
+    mut producer: HeapProd<ScheduledEvent>,
+    audio_counter: Arc<AtomicU64>,
+) {
+    std::thread::spawn(move || {
+        let midi_in = match midir::MidiInput::new("aurio") {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[midi] init failed: {}", e);
+                return;
+            }
+        };
+
+        let ports = midi_in.ports();
+        if ports.is_empty() {
+            eprintln!("[midi] no input ports available");
+            return;
+        }
+
+        let port = ports[0].clone();
+        let port_name = midi_in
+            .port_name(&port)
+            .unwrap_or_else(|_| "?".to_string());
+        println!("[midi] listening on: {}", port_name);
+
+        let _conn = match midi_in.connect(
+            &port,
+            "aurio-input",
+            move |_ts, msg, _| {
+                // Control Change: status byte 0xBn where n is the channel
+                if msg.len() >= 3 && (msg[0] & 0xF0) == 0xB0 {
+                    let channel = msg[0] & 0x0F;
+                    let cc = msg[1];
+                    let raw = msg[2] as f32 / 127.0;
+
+                    for b in &bindings {
+                        if b.cc == cc && b.channel.is_none_or(|c| c == channel) {
+                            let value = b.range.0 + raw * (b.range.1 - b.range.0);
+                            let event = ScheduledEvent::set_param(
+                                audio_counter.load(Ordering::Relaxed),
+                                b.node_idx,
+                                b.param_idx,
+                                value,
+                            );
+                            // Drop on overflow — knob noise is fine to lose.
+                            let _ = producer.try_push(event);
+                        }
+                    }
+                }
+            },
+            (),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[midi] connect failed: {}", e);
+                return;
+            }
+        };
+
+        // Park forever to keep the connection (and its callback) alive.
+        std::thread::park();
+    });
 }
 
 fn build_phrase_entry(

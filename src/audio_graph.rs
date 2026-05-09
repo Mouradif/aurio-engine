@@ -1,4 +1,8 @@
-use crate::{effect::Effect, instrument::Instrument, midi::ScheduledEvent};
+use crate::{
+    effect::Effect,
+    instrument::Instrument,
+    midi::{EventKind, ScheduledEvent},
+};
 
 pub enum AudioNode {
     Source(Box<dyn Instrument + Send>),
@@ -38,11 +42,24 @@ impl AudioGraph {
     }
 
     pub fn process_event(&mut self, event: &ScheduledEvent) {
-        for node in &mut self.nodes {
-            if let AudioNode::Source(instrument) = node
-                && event.targets.contains(&instrument.id())
-            {
-                instrument.process_event(&event.event);
+        match &event.kind {
+            EventKind::Note { targets, event } => {
+                for node in &mut self.nodes {
+                    if let AudioNode::Source(instrument) = node
+                        && targets.contains(&instrument.id())
+                    {
+                        instrument.process_event(event);
+                    }
+                }
+            }
+            EventKind::SetParam {
+                node_idx,
+                param_idx,
+                value,
+            } => {
+                if let Some(AudioNode::Processor(effect)) = self.nodes.get_mut(*node_idx) {
+                    effect.set_param(*param_idx, *value);
+                }
             }
         }
     }
