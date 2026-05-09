@@ -1,5 +1,5 @@
 use crate::audio_graph::{AudioGraph, AudioNode};
-use crate::effect::{Gain, Reverb};
+use crate::effect::{Bitcrusher, Distortion, Gain, Highpass, Lowpass, Reverb, Tremolo};
 use crate::midi::{MidiNote, ScheduledEvent};
 use crate::oscillator::{Oscillator, Wave};
 use crate::phrase::{Phrase, PhraseEntry, PhraseHooks};
@@ -45,6 +45,11 @@ enum SocketContent {
 enum EffectSpec {
     Gain { level: f32 },
     Reverb { delay: f32, feedback: f32, mix: f32 },
+    Lowpass { cutoff: f32 },
+    Highpass { cutoff: f32 },
+    Distortion { drive: f32, mix: f32 },
+    Tremolo { rate: f32, depth: f32 },
+    Bitcrusher { bits: f32 },
 }
 
 enum SocketRef {
@@ -212,6 +217,23 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                             delay: params.get("delay")?,
                             feedback: params.get("feedback")?,
                             mix: params.get("mix")?,
+                        },
+                        "Lowpass" => EffectSpec::Lowpass {
+                            cutoff: params.get("cutoff")?,
+                        },
+                        "Highpass" => EffectSpec::Highpass {
+                            cutoff: params.get("cutoff")?,
+                        },
+                        "Distortion" => EffectSpec::Distortion {
+                            drive: params.get("drive")?,
+                            mix: params.get("mix")?,
+                        },
+                        "Tremolo" => EffectSpec::Tremolo {
+                            rate: params.get("rate")?,
+                            depth: params.get("depth")?,
+                        },
+                        "Bitcrusher" => EffectSpec::Bitcrusher {
+                            bits: params.get("bits")?,
                         },
                         other => {
                             return Err(mlua::Error::RuntimeError(format!(
@@ -470,6 +492,21 @@ impl Song {
                     mix,
                 }) => {
                     AudioNode::Processor(Box::new(Reverb::new(delay, feedback, mix, sample_rate)))
+                }
+                SocketContent::Effect(EffectSpec::Lowpass { cutoff }) => {
+                    AudioNode::Processor(Box::new(Lowpass::new(cutoff, sample_rate)))
+                }
+                SocketContent::Effect(EffectSpec::Highpass { cutoff }) => {
+                    AudioNode::Processor(Box::new(Highpass::new(cutoff, sample_rate)))
+                }
+                SocketContent::Effect(EffectSpec::Distortion { drive, mix }) => {
+                    AudioNode::Processor(Box::new(Distortion::new(drive, mix)))
+                }
+                SocketContent::Effect(EffectSpec::Tremolo { rate, depth }) => {
+                    AudioNode::Processor(Box::new(Tremolo::new(rate, depth, sample_rate)))
+                }
+                SocketContent::Effect(EffectSpec::Bitcrusher { bits }) => {
+                    AudioNode::Processor(Box::new(Bitcrusher::new(bits)))
                 }
                 SocketContent::Output => AudioNode::Output,
             };
