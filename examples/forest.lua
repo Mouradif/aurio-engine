@@ -2,17 +2,17 @@ song:bpm(120)
 
 -- Instruments
 song:instrument(0, {
-    adsr = { 0.025, 0.1, 1.0, 0.2 },
-    oscillators = {
-        { wave = "Sine",     gain = 0.4 },
-        { wave = "Triangle", gain = 0.2 },
-        { wave = "Saw",      gain = 0.1 },
-    },
+  adsr = { 0.025, 0.1, 1.0, 0.2 },
+  oscillators = {
+    { wave = "Sine",     gain = 0.4 },
+    { wave = "Triangle", gain = 0.2 },
+    { wave = "Saw",      gain = 0.1 },
+  },
 })
 
 song:instrument(1, {
-    adsr = { 0.0, 0.1, 0.7, 0.05 },
-    oscillators = { { wave = "Sine", gain = 1.0 } },
+  adsr = { 0.0, 0.1, 0.7, 0.05 },
+  oscillators = { { wave = "Sine", gain = 1.0 } },
 }, { label = "Bass" })
 
 -- Effects
@@ -31,78 +31,103 @@ song:connection("Bass",       "bass_gain")
 song:connection("bass_gain",  "main")
 
 -- Phrases
-local piano_a_notes = {}
-local piano_a_pitches = { 79, 84, 86, 91 }
-for i = 0, 31 do
-    table.insert(piano_a_notes, {
-        pitch = piano_a_pitches[(i % 4) + 1],
-        start = i * 0.5,
-        duration = 0.45,
-    })
-end
-
 song:phrase("Piano A", {
-    duration = 16.0,
-    on_enter = function()
-        cycle = (cycle or 0) + 1
-        print("[hook] starting cycle " .. cycle)
-    end,
-    on_exit = function()
-        print("[hook] piano A leaving on cycle " .. cycle)
-    end,
-    notes = piano_a_notes,
+  duration = 2.0,
+  on_enter = function()
+    piano_a_count = 0
+    print("[hook] piano A entering")
+  end,
+  on_loop = function()
+    piano_a_count = piano_a_count + 1
+    print("[hook] piano A loop " .. piano_a_count)
+  end,
+  on_exit = function()
+    print("[hook] piano A leaving after " .. piano_a_count .. " loops")
+  end,
+  notes = {
+    { pitch = 79, start = 0.0, duration = 0.45 },
+    { pitch = 84, start = 0.5, duration = 0.45 },
+    { pitch = 86, start = 1.0, duration = 0.45 },
+    { pitch = 91, start = 1.5, duration = 0.45 },
+  },
 })
 
 song:phrase("Piano B", {
-    rtttl = [[
-        8a3 8c3 8e3 8f3
-        8a3 8c3 8e3 8f3
-        8a3 8c3 8e3 8f3
-        8a3 8c3 8e3 8f3
-        8a3 8c3 8e3 8f3
-        8a3 8c3 8e3 8f3
-        8a3 8c3 8e3 8f3
-        8a3 8c3 8e3 8f3
+  on_enter = function()
+    piano_b_count = 0
+    print("[hook] piano B entering")
+  end,
+  on_loop = function()
+    piano_b_count = piano_b_count + 1
+    print("[hook] piano B loop " .. piano_b_count)
+  end,
+  rtttl = [[
+        8a3 8c4 8e4 8f4
     ]],
 })
 
 song:phrase("Bass A", {
-    duration = 16.0,
-    notes = {  -- table = static
-        { pitch = 51, start = 0,    duration = 7.5 },
-        { pitch = 58, start = 7.5,  duration = 0.5 },
-        { pitch = 51, start = 8.0,  duration = 6.0 },
-        { pitch = 63, start = 14.0, duration = 2.0 },
-    },
+  duration = 16.0,
+  notes = {
+    { pitch = 51, start = 0,    duration = 7.5 },
+    { pitch = 58, start = 7.5,  duration = 0.5 },
+    { pitch = 51, start = 8.0,  duration = 6.0 },
+    { pitch = 63, start = 14.0, duration = 2.0 },
+  },
 })
 
 song:phrase("Bass B", {
-    duration = 16.0,
-    notes = function()  -- function = re-evaluate each loop
-        return {
-            { pitch = 62, start = 0,    duration = 7.5 },
-            { pitch = 57, start = 7.5,  duration = 0.5 },
-            { pitch = 50, start = 8.0,  duration = 6.0 },
-            { pitch = 50, start = 14.5, duration = 0.5 },
-        }
-    end,
+  duration = 16.0,
+  notes = {
+    { pitch = 62, start = 0,    duration = 7.5 },
+    { pitch = 57, start = 7.5,  duration = 0.5 },
+    { pitch = 50, start = 8.0,  duration = 6.0 },
+    { pitch = 50, start = 14.5, duration = 0.5 },
+  }
+})
+
+song:phrase("Bass C", {
+  duration = 16.0,
+  notes = {
+    { pitch = 51, start = 0,    duration = 6.5 },
+    { pitch = 58, start = 6.5,  duration = 1.0 },
+    { pitch = 39, start = 7.5,  duration = 0.5 },
+    { pitch = 51, start = 8.0,  duration = 1.0 },
+    { pitch = 51, start = 9.5,  duration = 1.0 },
+    { pitch = 51, start = 11.0,  duration = 0.5 },
+    { pitch = 63, start = 14.0, duration = 2.0 },
+  }
+})
+
+song:phrase("Bass D", {
+  duration = 16.0,
+  notes = {
+    { pitch = 62, start = 0,    duration = 6.5 },
+    { pitch = 57, start = 6.5,  duration = 1.0 },
+    { pitch = 62, start = 7.5,  duration = 0.5 },
+    { pitch = 50, start = 8.0,  duration = 1.0 },
+    { pitch = 50, start = 9.5,  duration = 1.0 },
+    { pitch = 50, start = 11.0,  duration = 1.0 },
+  }
 })
 
 -- Tracks
 song:track({
-    targets = { 0 },
-    initial = "Piano A",
-    transitions = {
-        { from = "Piano A", to = "Piano B" },
-        { from = "Piano B", to = "Piano A" },
-    },
+  targets = { 0 },
+  initial = "Piano A",
+  transitions = {
+    { from = "Piano A", to = "Piano B", condition = function() return piano_a_count == 7 end },
+    { from = "Piano B", to = "Piano A", condition = function() return piano_b_count == 7 end },
+  },
 })
 
 song:track({
-    targets = { "Bass" },
-    initial = "Bass A",
-    transitions = {
-        { from = "Bass A", to = "Bass B" },
-        { from = "Bass B", to = "Bass A" },
-    },
+  targets = { "Bass" },
+  initial = "Bass A",
+  transitions = {
+    { from = "Bass A", to = "Bass B" },
+    { from = "Bass B", to = "Bass C" },
+    { from = "Bass C", to = "Bass D" },
+    { from = "Bass D", to = "Bass A" },
+  },
 })

@@ -42,11 +42,6 @@ impl AudioGraph {
             if let AudioNode::Source(instrument) = node
                 && event.targets.contains(&instrument.id())
             {
-                println!(
-                    "Sending event {:?} to instrument {}",
-                    event,
-                    instrument.id()
-                );
                 instrument.process_event(&event.event);
             }
         }

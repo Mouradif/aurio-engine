@@ -393,6 +393,22 @@ impl Song {
 
         let code = std::fs::read_to_string(path.as_ref())?;
         let chunk_name = path.as_ref().display().to_string();
+
+        // Make `require` resolve modules relative to the entry file's directory.
+        let parent = path
+            .as_ref()
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let parent_str = parent.display().to_string();
+        let package: Table = lua.lua().globals().get("package")?;
+        let current_path: String = package.get("path")?;
+        package.set(
+            "path",
+            format!("{0}/?.lua;{0}/?/init.lua;{1}", parent_str, current_path),
+        )?;
+
         lua.lua().load(&code).set_name(chunk_name).exec()?;
 
         let state = builder

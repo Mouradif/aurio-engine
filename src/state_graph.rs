@@ -130,11 +130,10 @@ pub fn run_timing_thread(
             if from_idx == to_idx {
                 run_hook(lua, &from_entry.hooks.on_loop);
             } else {
+                println!("[timing] Transition to {}", to_entry.phrase.name());
                 run_hook(lua, &from_entry.hooks.on_exit);
                 run_hook(lua, &to_entry.hooks.on_enter);
             }
-
-            println!("[timing] Transition to {}", to_entry.phrase.name());
 
             current_phrases[i] = to_idx;
             let notes = to_entry.phrase.notes(lua);
