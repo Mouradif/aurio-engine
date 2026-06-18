@@ -95,6 +95,7 @@ enum EffectSpec {
         feedback: ParamSpec,
         mix: ParamSpec,
         ping_pong: bool,
+        glide: f32,
     },
 }
 
@@ -426,13 +427,36 @@ fn parse_note_duration(s: &str) -> mlua::Result<f32> {
     Ok(if dotted { beats * 1.5 } else { beats })
 }
 
-/// Parse one delay-time value: a number (ms), a note-duration string, or a
-/// modulator table (ms).
-fn parse_delay_time(v: Value) -> mlua::Result<DelayTimeSpec> {
+/// Parse one delay-time value: a number (ms), a note-duration string, a
+/// modulator table (ms), or a `midi_connect` handle (records a binding on
+/// `param_idx` and seeds the initial ms value).
+fn parse_delay_time(
+    v: Value,
+    socket_id: u32,
+    param_idx: u8,
+    builder: &mut SongBuilder,
+) -> mlua::Result<DelayTimeSpec> {
     match v {
         Value::Number(n) => Ok(DelayTimeSpec::Ms(n as f32)),
         Value::Integer(i) => Ok(DelayTimeSpec::Ms(i as f32)),
         Value::String(s) => Ok(DelayTimeSpec::Beats(parse_note_duration(&s.to_str()?)?)),
+        Value::UserData(ud) => {
+            let live = ud.borrow::<LiveParam>().map_err(|_| {
+                mlua::Error::RuntimeError(
+                    "delay time userdata must be a midi_connect handle".into(),
+                )
+            })?;
+            builder.pending_bindings.push(PendingBinding {
+                cc: live.cc,
+                channel: live.channel,
+                range: live.range,
+                socket_id,
+                param_idx,
+            });
+            // The MIDI thread writes ms directly into the param's target; start
+            // at the handle's initial value (also ms).
+            Ok(DelayTimeSpec::Ms(live.initial))
+        }
         Value::Table(t) => {
             let name: String = t.get("name").map_err(|_| {
                 mlua::Error::RuntimeError(
@@ -442,29 +466,35 @@ fn parse_delay_time(v: Value) -> mlua::Result<DelayTimeSpec> {
             Ok(DelayTimeSpec::Mod(parse_modulator(&name, &t)?))
         }
         _ => Err(mlua::Error::RuntimeError(
-            "delay time must be a number (ms), a note string like \"4.\", or a modulator".into(),
+            "delay time must be a number (ms), a note string like \"4.\", a modulator, or midi_connect".into(),
         )),
     }
 }
 
 /// Parse the `time` field, which is either a single value (mono → both
-/// channels) or a `{left, right}` pair. Returns (left, right).
-fn parse_delay_times(params: &Table) -> mlua::Result<(DelayTimeSpec, DelayTimeSpec)> {
+/// channels) or a `{left, right}` pair. Returns (left, right). A single
+/// `midi_connect` handle binds *both* taps so one knob moves them together.
+fn parse_delay_times(
+    params: &Table,
+    socket_id: u32,
+    builder: &mut SongBuilder,
+) -> mlua::Result<(DelayTimeSpec, DelayTimeSpec)> {
     let v: Value = params.get("time")?;
     match v {
         // A 2-element array (no `name` key) is an L/R pair; a table *with*
         // `name` is a single modulator value.
         Value::Table(ref t) if t.get::<Option<Value>>("name")?.is_none() && t.raw_len() == 2 => {
-            let left = parse_delay_time(t.get(1)?)?;
-            let right = parse_delay_time(t.get(2)?)?;
+            let left = parse_delay_time(t.get(1)?, socket_id, Delay::PARAM_TIME_L, builder)?;
+            let right = parse_delay_time(t.get(2)?, socket_id, Delay::PARAM_TIME_R, builder)?;
             Ok((left, right))
         }
         Value::Nil => Err(mlua::Error::RuntimeError("delay missing 'time'".into())),
         other => {
             // Single value applies to both channels. Re-parse for each side so
-            // each owns its own spec (modulators are Copy, constants trivial).
-            let left = parse_delay_time(other.clone())?;
-            let right = parse_delay_time(other)?;
+            // each owns its own spec and (for a midi_connect handle) records a
+            // binding on both PARAM_TIME_L and PARAM_TIME_R.
+            let left = parse_delay_time(other.clone(), socket_id, Delay::PARAM_TIME_L, builder)?;
+            let right = parse_delay_time(other, socket_id, Delay::PARAM_TIME_R, builder)?;
             Ok((left, right))
         }
     }
@@ -729,7 +759,7 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                             EffectSpec::Pan { amount }
                         }
                         "Delay" => {
-                            let (time_l, time_r) = parse_delay_times(&params)?;
+                            let (time_l, time_r) = parse_delay_times(&params, id, builder)?;
                             // feedback/mix default to sensible values if omitted.
                             let feedback = if params.contains_key("feedback")? {
                                 extract_param(
@@ -749,12 +779,16 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                             };
                             let ping_pong =
                                 params.get::<Option<bool>>("ping_pong")?.unwrap_or(false);
+                            // Glide time constant in seconds; 0 (default) = no
+                            // glide, no Doppler.
+                            let glide = params.get::<Option<f32>>("glide")?.unwrap_or(0.0);
                             EffectSpec::Delay {
                                 time_l,
                                 time_r,
                                 feedback,
                                 mix,
                                 ping_pong,
+                                glide,
                             }
                         }
                         other => {
@@ -1129,6 +1163,7 @@ impl Song {
                     feedback,
                     mix,
                     ping_pong,
+                    glide,
                 }) => {
                     let (time_l, init_l) = time_l.build(bpm, sample_rate);
                     let (time_r, init_r) = time_r.build(bpm, sample_rate);
@@ -1138,6 +1173,7 @@ impl Song {
                         feedback.build(sample_rate),
                         mix.build(sample_rate),
                         ping_pong,
+                        glide,
                         init_l,
                         init_r,
                         sample_rate,

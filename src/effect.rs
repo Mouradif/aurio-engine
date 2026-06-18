@@ -378,11 +378,12 @@ impl Effect for Bitcrusher {
     }
 }
 
-/// A stereo delay line with the analog-pedal/tape character: the read tap's
-/// delay time is *glided* toward its target each sample, so changing the time
-/// (whether by a constant, MIDI CC, or an LFO modulator) makes the read head
-/// move at a different rate than the write head — resampling the buffered audio
-/// and producing the characteristic Doppler pitch-bend.
+/// A stereo delay line. When `glide` is set, the read tap's delay time is
+/// *eased* toward its target each sample, so changing the time (constant, MIDI
+/// CC, or LFO) makes the read head move at a different rate than the write head
+/// — resampling the buffered audio into the characteristic tape Doppler pitch
+/// bend. With `glide = 0` (the default) the time tracks its target directly and
+/// there's no Doppler.
 ///
 /// Per-channel time lets the left and right taps differ; `feedback` repeats the
 /// echoes, and `ping_pong` routes each channel's feedback into the *other*
@@ -396,6 +397,9 @@ pub struct Delay {
     /// Internally glided current delay in *samples* per channel.
     current_l: f32,
     current_r: f32,
+    /// One-pole coefficient for easing `current_*` toward target. 1.0 = no
+    /// glide (instant, no Doppler); smaller = slower, more pitch bend.
+    glide_coeff: f32,
     feedback: Param,
     mix: Param,
     ping_pong: bool,
@@ -411,9 +415,16 @@ impl Delay {
     /// Maximum delay the buffer can hold; times are clamped to this.
     pub const MAX_DELAY_SECONDS: f32 = 4.0;
 
-    /// Glide rate toward the target delay, per sample. Small = slow, syrupy
-    /// tape-style pitch glide on time changes (matches the original feel).
-    const GLIDE: f32 = 0.0005;
+    /// Convert a glide *time constant* in seconds to the per-sample one-pole
+    /// coefficient. `glide_seconds <= 0` means no glide → coefficient 1.0
+    /// (the current delay snaps to its target every sample, no Doppler).
+    fn glide_coeff(glide_seconds: f32, sample_rate: f32) -> f32 {
+        if glide_seconds <= 0.0 {
+            1.0
+        } else {
+            1.0 - (-1.0 / (glide_seconds * sample_rate)).exp()
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -422,6 +433,7 @@ impl Delay {
         feedback: Param,
         mix: Param,
         ping_pong: bool,
+        glide_seconds: f32,
         initial_samples_l: f32,
         initial_samples_r: f32,
         sample_rate: f32,
@@ -436,6 +448,7 @@ impl Delay {
             // rather than gliding up from zero.
             current_l: initial_samples_l,
             current_r: initial_samples_r,
+            glide_coeff: Self::glide_coeff(glide_seconds, sample_rate),
             feedback,
             mix,
             ping_pong,
@@ -465,8 +478,8 @@ impl Effect for Delay {
             .clamp(1.0, max_samples);
         let target_r = (self.time_r.next(self.sample_rate) * 0.001 * self.sample_rate)
             .clamp(1.0, max_samples);
-        self.current_l += (target_l - self.current_l) * Self::GLIDE;
-        self.current_r += (target_r - self.current_r) * Self::GLIDE;
+        self.current_l += (target_l - self.current_l) * self.glide_coeff;
+        self.current_r += (target_r - self.current_r) * self.glide_coeff;
 
         let feedback = self.feedback.next(self.sample_rate).clamp(0.0, 0.95);
         let mix = self.mix.next(self.sample_rate).clamp(0.0, 1.0);

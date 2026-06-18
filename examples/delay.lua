@@ -37,10 +37,16 @@ song:effect(11, "Delay", {
 -- A second, deliberately Doppler-y delay: a slow sine sweeps the time between
 -- 120 ms and 400 ms. As the read head chases the moving target, the echoes
 -- warble up and down in pitch — the tape-delay sound.
+--
+-- `glide` eases the read head toward the target over a time constant (seconds).
+-- It defaults to 0 (no glide, no Doppler) — but here the *modulator* already
+-- moves the time smoothly, so you get the warble even at glide=0. A small
+-- glide adds extra smoothing and makes stepped/CC time changes bend too.
 song:effect(12, "Delay", {
   time     = { name = "sine", freq = 0.1, low = 120, high = 400 },
   feedback = 0.5,
   mix      = 0.45,
+  glide    = 0.04,
 }, { label = "tape" })
 
 song:output(99, { label = "main" })

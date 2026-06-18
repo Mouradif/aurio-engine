@@ -5,8 +5,9 @@
 -- live from a knob/fader.
 --
 -- Default mapping (works with most generic controllers):
---   CC 23 → distortion mix     (0.0 dry  → 1.0 wet)
---   CC 22 → master gain        (silent  → 0.6)
+--   CC 53 → distortion mix     (0.0 dry  → 1.0 wet)
+--   CC 52 → master gain        (silent  → 0.6)
+--   CC 51 → delay time         (5 ms .. 800 ms) — ride it for the Doppler
 --
 -- Edit the cc numbers below to match your controller. The first available
 -- MIDI input port is opened automatically on startup.
@@ -33,11 +34,23 @@ song:effect(11, "Gain", {
   level = midi_connect({ cc = 52, range = { 0.0, 0.6 }, initial = 0.2 }),
 }, { label = "master" })
 
+-- Delay time bound to a CC. The raw 0..127 maps into the `range` (in ms).
+-- `glide` (seconds) eases the read head toward each new knob value, so riding
+-- the knob bends the echo pitch like a tape delay. Without glide the time
+-- would just jump (no Doppler). `initial` is the starting time in ms.
+song:effect(12, "Delay", {
+  time = midi_connect({ cc = 51, range = { 5, 800 }, initial = 200 }),
+  feedback = 0.5,
+  mix = 0.5,
+  glide = 0.08,
+}, { label = "delay" })
+
 song:output(99, { label = "main" })
 
 song:connection("Drone",  "drive")
 song:connection("drive",  "master")
-song:connection("master", "main")
+song:connection("master", "delay")
+song:connection("delay",  "main")
 
 -- A long held note so you can hear the live param changes clearly.
 song:phrase("Drone Phrase", {
