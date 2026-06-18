@@ -7,6 +7,7 @@ pub mod phrase;
 pub mod phrase_script;
 pub mod project;
 pub mod rtttl;
+pub mod sampler;
 pub mod scripting;
 pub mod state_graph;
 pub mod static_phrase;

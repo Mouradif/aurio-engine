@@ -4,7 +4,9 @@ use crate::midi::{MidiNote, ScheduledEvent};
 use crate::oscillator::{Oscillator, Wave};
 use crate::phrase::{Phrase, PhraseEntry, PhraseHooks};
 use crate::phrase_script::PhraseScript;
+use crate::midi::{note_name_to_midi, parse_note_value};
 use crate::rtttl::parse_rtttl;
+use crate::sampler::{Sample, Sampler, Zone};
 use crate::scripting::{LuaRuntime, notes_from_table};
 use crate::state_graph::{StateGraph, run_timing_thread};
 use crate::static_phrase::StaticPhrase;
@@ -39,8 +41,20 @@ enum SocketContent {
         adsr: ADSR,
         oscillators: Vec<(Wave, f32)>,
     },
+    Sampler {
+        zones: Vec<SamplerZoneSpec>,
+    },
     Effect(EffectSpec),
     Output,
+}
+
+/// One zone of a sampler, as declared in Lua: a WAV file (already resolved to
+/// an absolute path) mapped to a key range and pitched relative to `root`.
+struct SamplerZoneSpec {
+    file: String,
+    root: u8,
+    low: u8,
+    high: u8,
 }
 
 enum EffectSpec {
@@ -120,6 +134,9 @@ struct ResolvedBinding {
 #[derive(Default)]
 struct SongBuilder {
     bpm: Option<f32>,
+    /// Directory of the entry song file; used to resolve relative WAV paths
+    /// declared in `song:sampler(...)`.
+    base_dir: std::path::PathBuf,
     sockets: Vec<SocketEntry>,
     labels: HashMap<String, u32>,
     connections: Vec<(SocketRef, SocketRef)>,
@@ -315,6 +332,86 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                         SocketContent::Instrument { adsr, oscillators },
                         label,
                     )?;
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
+            "sampler",
+            lua.create_function(
+                move |_, (_self, id, config, opts): (Value, u32, Table, Option<Table>)| {
+                    let mut guard = b.lock().unwrap();
+                    let builder = guard.as_mut().unwrap();
+                    let base_dir = builder.base_dir.clone();
+
+                    // Parse one zone from a Lua table. `low`/`high` default to
+                    // `root` (a single-key mapping); `root` defaults to c3.
+                    let parse_zone = |t: &Table| -> mlua::Result<SamplerZoneSpec> {
+                        let file: String = t.get("file")?;
+                        let root = match t.get::<Value>("root")? {
+                            Value::Nil => note_name_to_midi("c3")
+                                .map_err(mlua::Error::RuntimeError)?,
+                            v => parse_note_value(&v)?,
+                        };
+                        let low = match t.get::<Value>("low")? {
+                            Value::Nil => root,
+                            v => parse_note_value(&v)?,
+                        };
+                        let high = match t.get::<Value>("high")? {
+                            Value::Nil => root,
+                            v => parse_note_value(&v)?,
+                        };
+                        if low > high {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "sampler zone for '{}' has low > high",
+                                file
+                            )));
+                        }
+                        // Resolve relative WAV paths against the song's dir.
+                        let path = base_dir.join(&file);
+                        Ok(SamplerZoneSpec {
+                            file: path.to_string_lossy().into_owned(),
+                            root,
+                            low,
+                            high,
+                        })
+                    };
+
+                    // Two forms: a single `file=...` (basic), or a `samples`
+                    // list of zone tables (advanced).
+                    let zones = match config.get::<Value>("samples")? {
+                        Value::Table(list) => {
+                            let mut zones = Vec::new();
+                            for v in list.sequence_values::<Table>() {
+                                zones.push(parse_zone(&v?)?);
+                            }
+                            if zones.is_empty() {
+                                return Err(mlua::Error::RuntimeError(
+                                    "sampler 'samples' list is empty".into(),
+                                ));
+                            }
+                            zones
+                        }
+                        Value::Nil => {
+                            // Basic single-sample form: map the whole keyboard.
+                            let mut zone = parse_zone(&config)?;
+                            zone.low = 0;
+                            zone.high = 127;
+                            vec![zone]
+                        }
+                        _ => {
+                            return Err(mlua::Error::RuntimeError(
+                                "sampler 'samples' must be a list of zone tables".into(),
+                            ));
+                        }
+                    };
+
+                    let label = label_from_opts(opts)?;
+                    builder.add_socket(id, SocketContent::Sampler { zones }, label)?;
                     Ok(())
                 },
             )?,
@@ -547,7 +644,17 @@ impl Song {
         path: P,
         lua: &LuaRuntime,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let builder: SharedBuilder = Arc::new(Mutex::new(Some(SongBuilder::default())));
+        let parent = path
+            .as_ref()
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        let builder: SharedBuilder = Arc::new(Mutex::new(Some(SongBuilder {
+            base_dir: parent.clone(),
+            ..SongBuilder::default()
+        })));
         let song_table = lua.lua().create_table()?;
         register_methods(lua.lua(), &song_table, &builder)?;
         lua.lua().globals().set("song", song_table)?;
@@ -605,12 +712,6 @@ impl Song {
         let chunk_name = path.as_ref().display().to_string();
 
         // Make `require` resolve modules relative to the entry file's directory.
-        let parent = path
-            .as_ref()
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
         let parent_str = parent.display().to_string();
         let package: Table = lua.lua().globals().get("package")?;
         let current_path: String = package.get("path")?;
@@ -672,6 +773,26 @@ impl Song {
                         .collect();
                     let synth = Synth::new(socket.id as usize, adsr, oscillators);
                     AudioNode::Source(Box::new(synth))
+                }
+                SocketContent::Sampler { zones } => {
+                    // Load every WAV up front (setup time, never the audio
+                    // callback). A failed load is fatal — better to know now.
+                    let zones: Vec<Zone> = zones
+                        .into_iter()
+                        .map(|z| {
+                            let sample = Sample::load(&z.file).unwrap_or_else(|e| {
+                                panic!("sampler socket {}: {}", socket.id, e)
+                            });
+                            Zone {
+                                sample,
+                                root: z.root,
+                                low: z.low,
+                                high: z.high,
+                            }
+                        })
+                        .collect();
+                    let sampler = Sampler::new(socket.id as usize, zones);
+                    AudioNode::Source(Box::new(sampler))
                 }
                 SocketContent::Effect(EffectSpec::Gain { level }) => {
                     AudioNode::Processor(Box::new(Gain::new(level, sample_rate)))

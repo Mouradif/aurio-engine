@@ -58,6 +58,70 @@ pub fn midi_to_freq(note: u8) -> f32 {
     440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0)
 }
 
+/// Parse a note name like `"c3"`, `"f#2"`, `"A4"` into a MIDI pitch.
+///
+/// Uses the same octave convention as the RTTTL parser: `c` at octave 0 is
+/// MIDI 36, so `c3` is 72. Accepts upper/lowercase letters, an optional `#`
+/// sharp, and a single-digit octave (defaults to 3 if omitted).
+pub fn note_name_to_midi(name: &str) -> Result<u8, String> {
+    let mut chars = name.trim().chars().peekable();
+
+    let letter = chars
+        .next()
+        .ok_or_else(|| format!("empty note name: '{}'", name))?
+        .to_ascii_lowercase();
+    let base: i32 = match letter {
+        'c' => 36,
+        'd' => 38,
+        'e' => 40,
+        'f' => 41,
+        'g' => 43,
+        'a' => 45,
+        'b' => 47,
+        _ => return Err(format!("invalid note letter in '{}'", name)),
+    };
+
+    let mut semitone = base;
+    if matches!(chars.peek(), Some('#')) {
+        chars.next();
+        semitone += 1;
+    } else if matches!(chars.peek(), Some('b')) {
+        chars.next();
+        semitone -= 1;
+    }
+
+    let octave: i32 = match chars.next() {
+        Some(d @ '0'..='9') => (d as u8 - b'0') as i32,
+        None => 3,
+        Some(c) => return Err(format!("invalid octave '{}' in '{}'", c, name)),
+    };
+
+    if chars.next().is_some() {
+        return Err(format!("trailing characters in note name: '{}'", name));
+    }
+
+    let pitch = semitone + 12 * octave;
+    u8::try_from(pitch).map_err(|_| format!("note '{}' out of MIDI range", name))
+}
+
+/// Parse a pitch from a Lua value: either a note-name string like `"c3"` /
+/// `"f#2"` or a raw MIDI number. Shared by every Lua surface that takes a
+/// pitch (phrase notes, sampler zones, ...).
+pub fn parse_note_value(v: &mlua::Value) -> mlua::Result<u8> {
+    match v {
+        mlua::Value::String(s) => {
+            note_name_to_midi(&s.to_str()?).map_err(mlua::Error::RuntimeError)
+        }
+        mlua::Value::Integer(i) => u8::try_from(*i)
+            .map_err(|_| mlua::Error::RuntimeError(format!("note out of range: {}", i))),
+        mlua::Value::Number(n) => u8::try_from(*n as i64)
+            .map_err(|_| mlua::Error::RuntimeError(format!("note out of range: {}", n))),
+        _ => Err(mlua::Error::RuntimeError(
+            "expected a note name string or MIDI number".into(),
+        )),
+    }
+}
+
 pub fn schedule_phrase(
     targets: &[usize],
     notes: &[MidiNote],

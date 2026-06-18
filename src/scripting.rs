@@ -1,5 +1,5 @@
-use crate::midi::MidiNote;
-use mlua::{Function, Lua, RegistryKey, Table};
+use crate::midi::{MidiNote, parse_note_value};
+use mlua::{Function, Lua, RegistryKey, Table, Value};
 
 pub struct LuaRuntime {
     lua: Lua,
@@ -42,8 +42,9 @@ pub fn notes_from_table(table: &Table) -> Result<Vec<MidiNote>, mlua::Error> {
     for pair in table.pairs::<i64, Table>() {
         let (_, t) = pair?;
         let velocity: u8 = t.get::<Option<u8>>("velocity")?.unwrap_or(100);
+        let pitch_value: Value = t.get("pitch")?;
         notes.push(MidiNote {
-            pitch: t.get("pitch")?,
+            pitch: parse_note_value(&pitch_value)?,
             velocity,
             start_beat: t.get("start")?,
             duration_beats: t.get("duration")?,
