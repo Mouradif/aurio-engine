@@ -1,19 +1,22 @@
 use std::path::Path;
 
+use crate::frame::Frame;
 use crate::instrument::Instrument;
 use crate::midi::NoteEvent;
 
-/// A loaded WAV file: mono PCM data plus the sample rate it was recorded at.
+/// A loaded WAV file: stereo PCM data plus the sample rate it was recorded at.
 /// Owned by its `Zone`; voices reference it by index so playback touches no
-/// shared ownership and allocates nothing in the audio callback.
+/// shared ownership and allocates nothing in the audio callback. Mono files
+/// are widened to equal L/R; files with more than two channels are downmixed
+/// to stereo by averaging into both channels.
 pub struct Sample {
-    pub data: Vec<f32>,
+    pub data: Vec<Frame>,
     pub source_rate: f32,
 }
 
 impl Sample {
-    /// Load a WAV file from disk, downmixing to mono and normalizing integer
-    /// PCM to the -1.0..=1.0 range. Float WAVs are taken as-is.
+    /// Load a WAV file from disk as stereo, normalizing integer PCM to the
+    /// -1.0..=1.0 range. Float WAVs are taken as-is.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path = path.as_ref();
         let reader = hound::WavReader::open(path)
@@ -36,14 +39,15 @@ impl Sample {
             }
         };
 
-        // Downmix interleaved channels to mono by averaging.
-        let data: Vec<f32> = if channels <= 1 {
-            samples
-        } else {
-            samples
-                .chunks(channels)
-                .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-                .collect()
+        // De-interleave into stereo frames. Mono → both channels equal;
+        // stereo → L/R as-is; >2 channels → average into both channels.
+        let data: Vec<Frame> = match channels {
+            1 => samples.into_iter().map(Frame::mono).collect(),
+            2 => samples.chunks(2).map(|c| Frame::new(c[0], c[1])).collect(),
+            n => samples
+                .chunks(n)
+                .map(|c| Frame::mono(c.iter().sum::<f32>() / n as f32))
+                .collect(),
         };
 
         Ok(Self {
@@ -126,8 +130,8 @@ impl Instrument for Sampler {
         }
     }
 
-    fn next_sample(&mut self, sample_rate: f32) -> f32 {
-        let mut output = 0.0;
+    fn next_sample(&mut self, sample_rate: f32) -> Frame {
+        let mut output = Frame::SILENCE;
 
         for voice in &mut self.voices {
             let data = &self.zones[voice.zone].sample.data;
@@ -136,6 +140,7 @@ impl Instrument for Sampler {
                 continue;
             }
             let frac = voice.pos - i as f32;
+            // Linear interpolation per channel, via frame arithmetic.
             let s = data[i] * (1.0 - frac) + data[i + 1] * frac;
             output += s * voice.gain;
 

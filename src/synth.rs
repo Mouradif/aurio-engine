@@ -1,7 +1,9 @@
 use crate::{
+    frame::Frame,
     instrument::Instrument,
     midi::{NoteEvent, midi_to_freq},
     oscillator::{Oscillator, Wave},
+    param::Param,
 };
 #[derive(Clone)]
 pub struct ADSR {
@@ -21,7 +23,9 @@ pub enum EnvelopePhase {
 
 struct Voice {
     oscillator: Oscillator,
-    gain: f32,
+    /// Index into the synth's `oscillators`, so the voice can pick up that
+    /// oscillator's (possibly modulated) gain each frame.
+    osc_index: usize,
     pitch: u8,
     velocity: u8,
     envelope_phase: EnvelopePhase,
@@ -29,11 +33,11 @@ struct Voice {
 }
 
 impl Voice {
-    pub fn new(wave: Wave, pitch: u8, gain: f32, velocity: u8) -> Self {
+    pub fn new(wave: Wave, osc_index: usize, pitch: u8, velocity: u8) -> Self {
         Self {
             oscillator: Oscillator::new(wave),
+            osc_index,
             pitch: pitch.clamp(0, 127),
-            gain: gain.clamp(0.0, 1.0),
             velocity: velocity.clamp(1, 127),
             envelope_phase: EnvelopePhase::Attack(0.0),
             envelope_level: 0.0,
@@ -48,14 +52,17 @@ impl Voice {
         matches!(self.envelope_phase, EnvelopePhase::Done)
     }
 
-    pub fn next_sample(&mut self, adsr: &ADSR, sample_rate: f32) -> f32 {
+    /// Produce this voice's sample for the frame. `gain` is the oscillator's
+    /// already-evaluated gain for this frame (a `Param` is stateful, so it's
+    /// sampled once per oscillator by the synth, not per voice).
+    pub fn next_sample(&mut self, adsr: &ADSR, gain: f32, sample_rate: f32) -> f32 {
         let freq = midi_to_freq(self.pitch);
         let raw = self.oscillator.next_sample(freq, sample_rate);
         let velocity_scale = (self.velocity as f32) / 127.0;
         let level = self.envelope_level;
         self.advance_envelope(adsr, sample_rate);
 
-        raw * level * velocity_scale * self.gain
+        raw * level * velocity_scale * gain.clamp(0.0, 1.0)
     }
 
     fn advance_envelope(&mut self, adsr: &ADSR, sample_rate: f32) {
@@ -105,22 +112,30 @@ impl Voice {
 pub struct Synth {
     pub id: usize,
     pub adsr: ADSR,
-    pub oscillators: Vec<(Oscillator, f32)>,
+    /// Each oscillator carries a `Param` gain, sampled once per frame so the
+    /// gain can be a constant or an LFO without per-voice phase divergence.
+    pub oscillators: Vec<(Oscillator, Param)>,
     voices: Vec<Voice>,
+    /// Per-frame scratch holding each oscillator's evaluated gain. Pre-sized so
+    /// the audio callback never allocates.
+    gain_scratch: Vec<f32>,
 }
 
 impl Synth {
-    pub fn new(id: usize, adsr: ADSR, oscillators: Vec<(Oscillator, f32)>) -> Self {
+    pub fn new(id: usize, adsr: ADSR, oscillators: Vec<(Oscillator, Param)>) -> Self {
+        let gain_scratch = vec![0.0; oscillators.len()];
         Self {
             id,
             adsr,
             oscillators,
             voices: Vec::new(),
+            gain_scratch,
         }
     }
 
-    pub fn add_oscillator(&mut self, wave: Wave, gain: f32) {
+    pub fn add_oscillator(&mut self, wave: Wave, gain: Param) {
         self.oscillators.push((Oscillator::new(wave), gain));
+        self.gain_scratch.push(0.0);
     }
 }
 
@@ -129,11 +144,11 @@ impl Instrument for Synth {
         match event {
             NoteEvent::NoteOn { pitch, velocity } => {
                 self.voices.retain(|v| v.pitch != *pitch);
-                for (oscillator, gain) in &self.oscillators {
+                for (idx, (oscillator, _gain)) in self.oscillators.iter().enumerate() {
                     self.voices.push(Voice::new(
                         oscillator.wave.clone(),
+                        idx,
                         *pitch,
-                        *gain,
                         *velocity,
                     ));
                 }
@@ -148,13 +163,19 @@ impl Instrument for Synth {
         }
     }
 
-    fn next_sample(&mut self, sample_rate: f32) -> f32 {
+    fn next_sample(&mut self, sample_rate: f32) -> Frame {
+        // Evaluate every oscillator's gain once for this frame into scratch.
+        for (i, (_, gain)) in self.oscillators.iter_mut().enumerate() {
+            self.gain_scratch[i] = gain.next(sample_rate);
+        }
+
         let mut output = 0.0;
         for voice in &mut self.voices {
-            output += voice.next_sample(&self.adsr, sample_rate);
+            let gain = self.gain_scratch[voice.osc_index];
+            output += voice.next_sample(&self.adsr, gain, sample_rate);
         }
         self.voices.retain(|v| !v.is_done());
-        output
+        Frame::mono(output)
     }
 
     fn id(&self) -> usize {

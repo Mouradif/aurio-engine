@@ -1,7 +1,10 @@
 use crate::audio_graph::{AudioGraph, AudioNode};
-use crate::effect::{Bitcrusher, Distortion, Gain, Highpass, Lowpass, Reverb, Tremolo};
+use crate::effect::{
+    Bitcrusher, Delay, Distortion, Gain, Highpass, Lowpass, Pan, Reverb, Tremolo,
+};
 use crate::midi::{MidiNote, ScheduledEvent};
 use crate::oscillator::{Oscillator, Wave};
+use crate::param::{Modulator, Param};
 use crate::phrase::{Phrase, PhraseEntry, PhraseHooks};
 use crate::phrase_script::PhraseScript;
 use crate::midi::{note_name_to_midi, parse_note_value};
@@ -39,7 +42,7 @@ struct SocketEntry {
 enum SocketContent {
     Instrument {
         adsr: ADSR,
-        oscillators: Vec<(Wave, f32)>,
+        oscillators: Vec<(Wave, ParamSpec)>,
     },
     Sampler {
         zones: Vec<SamplerZoneSpec>,
@@ -58,13 +61,41 @@ struct SamplerZoneSpec {
 }
 
 enum EffectSpec {
-    Gain { level: f32 },
-    Reverb { delay: f32, feedback: f32, mix: f32 },
-    Lowpass { cutoff: f32 },
-    Highpass { cutoff: f32 },
-    Distortion { drive: f32, mix: f32 },
-    Tremolo { rate: f32, depth: f32 },
-    Bitcrusher { bits: f32 },
+    Gain {
+        level: ParamSpec,
+    },
+    Reverb {
+        delay: ParamSpec,
+        feedback: ParamSpec,
+        mix: ParamSpec,
+    },
+    Lowpass {
+        cutoff: ParamSpec,
+    },
+    Highpass {
+        cutoff: ParamSpec,
+    },
+    Distortion {
+        drive: ParamSpec,
+        mix: ParamSpec,
+    },
+    Tremolo {
+        rate: ParamSpec,
+        depth: ParamSpec,
+    },
+    Bitcrusher {
+        bits: ParamSpec,
+    },
+    Pan {
+        amount: ParamSpec,
+    },
+    Delay {
+        time_l: DelayTimeSpec,
+        time_r: DelayTimeSpec,
+        feedback: ParamSpec,
+        mix: ParamSpec,
+        ping_pong: bool,
+    },
 }
 
 enum SocketRef {
@@ -250,21 +281,59 @@ fn parse_midi_spec(s: &str) -> mlua::Result<(u8, Option<u8>)> {
     Ok((cc, channel))
 }
 
-/// Pull a numeric param out of a Lua params table, or — if it's a
-/// `LiveParam` userdata — record a pending MIDI binding and return its
-/// initial value. The binding is later resolved to a node index in
-/// `Song::play`.
+/// How a parameter was declared in Lua. Resolved into a runtime `Param` when
+/// the audio graph is built in `Song::play`.
+enum ParamSpec {
+    /// A plain constant (possibly live-controlled via a recorded MIDI binding).
+    Const(f32),
+    /// An LFO-style modulator evaluated per frame on the audio thread.
+    Mod(Modulator),
+}
+
+/// Parse a modulator declaration table: `{ name="sine", freq=, low=, high= }`.
+/// Recognized names: sine, triangle, ramp, square.
+fn parse_modulator(name: &str, t: &Table) -> mlua::Result<Modulator> {
+    let freq: f32 = t.get("freq")?;
+    let low: f32 = t.get::<Option<f32>>("low")?.unwrap_or(0.0);
+    let high: f32 = t.get::<Option<f32>>("high")?.unwrap_or(1.0);
+    Ok(match name {
+        "sine" => Modulator::Sine { freq, low, high },
+        "triangle" => Modulator::Triangle { freq, low, high },
+        "ramp" => Modulator::Ramp { freq, low, high },
+        "square" => Modulator::Square { freq, low, high },
+        other => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "unknown modulator: '{}' (expected sine, triangle, ramp, square)",
+                other
+            )));
+        }
+    })
+}
+
+/// Pull a param out of a Lua params table. A param may be:
+///   - a number → constant
+///   - a `midi_connect` handle → constant, with a recorded MIDI binding
+///   - a modulator table `{ name="sine", ... }` → per-frame LFO
 fn extract_param(
     params: &Table,
     name: &str,
     socket_id: u32,
     param_idx: u8,
     builder: &mut SongBuilder,
-) -> mlua::Result<f32> {
+) -> mlua::Result<ParamSpec> {
     let v: Value = params.get(name)?;
     match v {
-        Value::Number(n) => Ok(n as f32),
-        Value::Integer(i) => Ok(i as f32),
+        Value::Number(n) => Ok(ParamSpec::Const(n as f32)),
+        Value::Integer(i) => Ok(ParamSpec::Const(i as f32)),
+        Value::Table(t) => {
+            let mod_name: String = t.get("name").map_err(|_| {
+                mlua::Error::RuntimeError(format!(
+                    "'{}' table must have a 'name' field (modulator)",
+                    name
+                ))
+            })?;
+            Ok(ParamSpec::Mod(parse_modulator(&mod_name, &t)?))
+        }
         Value::UserData(ud) => {
             let live = ud.borrow::<LiveParam>().map_err(|_| {
                 mlua::Error::RuntimeError(format!(
@@ -279,16 +348,157 @@ fn extract_param(
                 socket_id,
                 param_idx,
             });
-            Ok(live.initial)
+            Ok(ParamSpec::Const(live.initial))
         }
         Value::Nil => Err(mlua::Error::RuntimeError(format!(
             "missing param: '{}'",
             name
         ))),
         _ => Err(mlua::Error::RuntimeError(format!(
-            "'{}' must be a number or a midi_connect handle",
+            "'{}' must be a number, a modulator table, or a midi_connect handle",
             name
         ))),
+    }
+}
+
+/// Parse a param value that supports constants and modulators but not MIDI
+/// binding (e.g. synth oscillator gain, which has no graph `set_param` route).
+fn parse_param_value(v: Value, what: &str) -> mlua::Result<ParamSpec> {
+    match v {
+        Value::Number(n) => Ok(ParamSpec::Const(n as f32)),
+        Value::Integer(i) => Ok(ParamSpec::Const(i as f32)),
+        Value::Table(t) => {
+            let mod_name: String = t.get("name").map_err(|_| {
+                mlua::Error::RuntimeError(format!(
+                    "{} table must have a 'name' field (modulator)",
+                    what
+                ))
+            })?;
+            Ok(ParamSpec::Mod(parse_modulator(&mod_name, &t)?))
+        }
+        _ => Err(mlua::Error::RuntimeError(format!(
+            "{} must be a number or a modulator table",
+            what
+        ))),
+    }
+}
+
+impl ParamSpec {
+    /// Build the runtime `Param`.
+    fn build(self, sample_rate: f32) -> Param {
+        match self {
+            ParamSpec::Const(v) => Param::constant(v, sample_rate),
+            ParamSpec::Mod(m) => Param::modulator(m),
+        }
+    }
+}
+
+/// A delay-time value as declared in Lua. Times resolve to milliseconds; note
+/// durations need BPM, so they're kept as beats until the graph is built.
+enum DelayTimeSpec {
+    /// Already in milliseconds.
+    Ms(f32),
+    /// A note duration in beats (e.g. "4." → 1.5), converted to ms via BPM.
+    Beats(f32),
+    /// A modulator whose low/high are in milliseconds.
+    Mod(Modulator),
+}
+
+/// Parse an RTTTL-style note-duration string into beats: the number is the
+/// note value (4 = quarter = 1 beat, 8 = eighth = 0.5 beat), and a trailing
+/// '.' dots it (×1.5).
+fn parse_note_duration(s: &str) -> mlua::Result<f32> {
+    let dotted = s.ends_with('.');
+    let digits = s.trim_end_matches('.');
+    let value: f32 = digits.parse().map_err(|_| {
+        mlua::Error::RuntimeError(format!(
+            "invalid note duration '{}' (expected e.g. \"4\", \"8.\")",
+            s
+        ))
+    })?;
+    if value <= 0.0 {
+        return Err(mlua::Error::RuntimeError(format!(
+            "note duration must be positive: '{}'",
+            s
+        )));
+    }
+    let beats = 4.0 / value;
+    Ok(if dotted { beats * 1.5 } else { beats })
+}
+
+/// Parse one delay-time value: a number (ms), a note-duration string, or a
+/// modulator table (ms).
+fn parse_delay_time(v: Value) -> mlua::Result<DelayTimeSpec> {
+    match v {
+        Value::Number(n) => Ok(DelayTimeSpec::Ms(n as f32)),
+        Value::Integer(i) => Ok(DelayTimeSpec::Ms(i as f32)),
+        Value::String(s) => Ok(DelayTimeSpec::Beats(parse_note_duration(&s.to_str()?)?)),
+        Value::Table(t) => {
+            let name: String = t.get("name").map_err(|_| {
+                mlua::Error::RuntimeError(
+                    "delay time table must be a modulator with a 'name' field".into(),
+                )
+            })?;
+            Ok(DelayTimeSpec::Mod(parse_modulator(&name, &t)?))
+        }
+        _ => Err(mlua::Error::RuntimeError(
+            "delay time must be a number (ms), a note string like \"4.\", or a modulator".into(),
+        )),
+    }
+}
+
+/// Parse the `time` field, which is either a single value (mono → both
+/// channels) or a `{left, right}` pair. Returns (left, right).
+fn parse_delay_times(params: &Table) -> mlua::Result<(DelayTimeSpec, DelayTimeSpec)> {
+    let v: Value = params.get("time")?;
+    match v {
+        // A 2-element array (no `name` key) is an L/R pair; a table *with*
+        // `name` is a single modulator value.
+        Value::Table(ref t) if t.get::<Option<Value>>("name")?.is_none() && t.raw_len() == 2 => {
+            let left = parse_delay_time(t.get(1)?)?;
+            let right = parse_delay_time(t.get(2)?)?;
+            Ok((left, right))
+        }
+        Value::Nil => Err(mlua::Error::RuntimeError("delay missing 'time'".into())),
+        other => {
+            // Single value applies to both channels. Re-parse for each side so
+            // each owns its own spec (modulators are Copy, constants trivial).
+            let left = parse_delay_time(other.clone())?;
+            let right = parse_delay_time(other)?;
+            Ok((left, right))
+        }
+    }
+}
+
+impl DelayTimeSpec {
+    /// Resolve to a runtime `Param` (ms), converting beats via BPM. Also
+    /// returns the initial delay in samples so the line can start in time.
+    fn build(self, bpm: f32, sample_rate: f32) -> (Param, f32) {
+        let ms = match self {
+            DelayTimeSpec::Ms(ms) => ms,
+            DelayTimeSpec::Beats(beats) => beats * (60_000.0 / bpm),
+            DelayTimeSpec::Mod(m) => {
+                // For a modulator the value moves on its own; use the param's
+                // first value as the initial sample count.
+                let param = Param::modulator(m);
+                let initial_samples = modulator_initial_ms(&m) * 0.001 * sample_rate;
+                return (param, initial_samples);
+            }
+        };
+        let param = Param::constant(ms, sample_rate);
+        (param, ms * 0.001 * sample_rate)
+    }
+}
+
+/// The value a modulator produces at phase 0 (its starting point), used to seed
+/// the delay line's initial read position.
+fn modulator_initial_ms(m: &Modulator) -> f32 {
+    match *m {
+        // All shapes start at `low` at phase 0 in our implementation.
+        Modulator::Sine { low, .. }
+        | Modulator::Triangle { low, .. }
+        | Modulator::Ramp { low, .. }
+        | Modulator::Square { low, .. } => low,
     }
 }
 
@@ -323,7 +533,8 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                         let osc = v?;
                         let wave_str: String = osc.get("wave")?;
                         let wave = parse_wave(&wave_str)?;
-                        let gain: f32 = osc.get("gain")?;
+                        let gain_value: Value = osc.get("gain")?;
+                        let gain = parse_param_value(gain_value, "oscillator gain")?;
                         oscillators.push((wave, gain));
                     }
                     let label = label_from_opts(opts)?;
@@ -442,15 +653,39 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                             EffectSpec::Gain { level }
                         }
                         "Reverb" => EffectSpec::Reverb {
-                            delay: params.get("delay")?,
-                            feedback: params.get("feedback")?,
-                            mix: params.get("mix")?,
+                            delay: extract_param(
+                                &params,
+                                "delay",
+                                id,
+                                Reverb::PARAM_DELAY,
+                                builder,
+                            )?,
+                            feedback: extract_param(
+                                &params,
+                                "feedback",
+                                id,
+                                Reverb::PARAM_FEEDBACK,
+                                builder,
+                            )?,
+                            mix: extract_param(&params, "mix", id, Reverb::PARAM_MIX, builder)?,
                         },
                         "Lowpass" => EffectSpec::Lowpass {
-                            cutoff: params.get("cutoff")?,
+                            cutoff: extract_param(
+                                &params,
+                                "cutoff",
+                                id,
+                                Lowpass::PARAM_CUTOFF,
+                                builder,
+                            )?,
                         },
                         "Highpass" => EffectSpec::Highpass {
-                            cutoff: params.get("cutoff")?,
+                            cutoff: extract_param(
+                                &params,
+                                "cutoff",
+                                id,
+                                Highpass::PARAM_CUTOFF,
+                                builder,
+                            )?,
                         },
                         "Distortion" => {
                             let drive = extract_param(
@@ -470,12 +705,58 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                             EffectSpec::Distortion { drive, mix }
                         }
                         "Tremolo" => EffectSpec::Tremolo {
-                            rate: params.get("rate")?,
-                            depth: params.get("depth")?,
+                            rate: extract_param(&params, "rate", id, Tremolo::PARAM_RATE, builder)?,
+                            depth: extract_param(
+                                &params,
+                                "depth",
+                                id,
+                                Tremolo::PARAM_DEPTH,
+                                builder,
+                            )?,
                         },
                         "Bitcrusher" => EffectSpec::Bitcrusher {
-                            bits: params.get("bits")?,
+                            bits: extract_param(
+                                &params,
+                                "bits",
+                                id,
+                                Bitcrusher::PARAM_BITS,
+                                builder,
+                            )?,
                         },
+                        "Pan" => {
+                            let amount =
+                                extract_param(&params, "amount", id, Pan::PARAM_AMOUNT, builder)?;
+                            EffectSpec::Pan { amount }
+                        }
+                        "Delay" => {
+                            let (time_l, time_r) = parse_delay_times(&params)?;
+                            // feedback/mix default to sensible values if omitted.
+                            let feedback = if params.contains_key("feedback")? {
+                                extract_param(
+                                    &params,
+                                    "feedback",
+                                    id,
+                                    Delay::PARAM_FEEDBACK,
+                                    builder,
+                                )?
+                            } else {
+                                ParamSpec::Const(0.3)
+                            };
+                            let mix = if params.contains_key("mix")? {
+                                extract_param(&params, "mix", id, Delay::PARAM_MIX, builder)?
+                            } else {
+                                ParamSpec::Const(0.5)
+                            };
+                            let ping_pong =
+                                params.get::<Option<bool>>("ping_pong")?.unwrap_or(false);
+                            EffectSpec::Delay {
+                                time_l,
+                                time_r,
+                                feedback,
+                                mix,
+                                ping_pong,
+                            }
+                        }
                         other => {
                             return Err(mlua::Error::RuntimeError(format!(
                                 "unknown effect: {}",
@@ -767,9 +1048,9 @@ impl Song {
         for socket in sockets {
             let node = match socket.content {
                 SocketContent::Instrument { adsr, oscillators } => {
-                    let oscillators: Vec<(Oscillator, f32)> = oscillators
+                    let oscillators: Vec<(Oscillator, Param)> = oscillators
                         .into_iter()
-                        .map(|(wave, gain)| (Oscillator::new(wave), gain))
+                        .map(|(wave, gain)| (Oscillator::new(wave), gain.build(sample_rate)))
                         .collect();
                     let synth = Synth::new(socket.id as usize, adsr, oscillators);
                     AudioNode::Source(Box::new(synth))
@@ -795,29 +1076,72 @@ impl Song {
                     AudioNode::Source(Box::new(sampler))
                 }
                 SocketContent::Effect(EffectSpec::Gain { level }) => {
-                    AudioNode::Processor(Box::new(Gain::new(level, sample_rate)))
+                    AudioNode::Processor(Box::new(Gain::new(level.build(sample_rate), sample_rate)))
                 }
                 SocketContent::Effect(EffectSpec::Reverb {
                     delay,
                     feedback,
                     mix,
-                }) => {
-                    AudioNode::Processor(Box::new(Reverb::new(delay, feedback, mix, sample_rate)))
-                }
+                }) => AudioNode::Processor(Box::new(Reverb::new(
+                    delay.build(sample_rate),
+                    feedback.build(sample_rate),
+                    mix.build(sample_rate),
+                    sample_rate,
+                ))),
                 SocketContent::Effect(EffectSpec::Lowpass { cutoff }) => {
-                    AudioNode::Processor(Box::new(Lowpass::new(cutoff, sample_rate)))
+                    AudioNode::Processor(Box::new(Lowpass::new(
+                        cutoff.build(sample_rate),
+                        sample_rate,
+                    )))
                 }
                 SocketContent::Effect(EffectSpec::Highpass { cutoff }) => {
-                    AudioNode::Processor(Box::new(Highpass::new(cutoff, sample_rate)))
+                    AudioNode::Processor(Box::new(Highpass::new(
+                        cutoff.build(sample_rate),
+                        sample_rate,
+                    )))
                 }
                 SocketContent::Effect(EffectSpec::Distortion { drive, mix }) => {
-                    AudioNode::Processor(Box::new(Distortion::new(drive, mix, sample_rate)))
+                    AudioNode::Processor(Box::new(Distortion::new(
+                        drive.build(sample_rate),
+                        mix.build(sample_rate),
+                        sample_rate,
+                    )))
                 }
                 SocketContent::Effect(EffectSpec::Tremolo { rate, depth }) => {
-                    AudioNode::Processor(Box::new(Tremolo::new(rate, depth, sample_rate)))
+                    AudioNode::Processor(Box::new(Tremolo::new(
+                        rate.build(sample_rate),
+                        depth.build(sample_rate),
+                        sample_rate,
+                    )))
                 }
                 SocketContent::Effect(EffectSpec::Bitcrusher { bits }) => {
-                    AudioNode::Processor(Box::new(Bitcrusher::new(bits)))
+                    AudioNode::Processor(Box::new(Bitcrusher::new(
+                        bits.build(sample_rate),
+                        sample_rate,
+                    )))
+                }
+                SocketContent::Effect(EffectSpec::Pan { amount }) => {
+                    AudioNode::Processor(Box::new(Pan::new(amount.build(sample_rate), sample_rate)))
+                }
+                SocketContent::Effect(EffectSpec::Delay {
+                    time_l,
+                    time_r,
+                    feedback,
+                    mix,
+                    ping_pong,
+                }) => {
+                    let (time_l, init_l) = time_l.build(bpm, sample_rate);
+                    let (time_r, init_r) = time_r.build(bpm, sample_rate);
+                    AudioNode::Processor(Box::new(Delay::new(
+                        time_l,
+                        time_r,
+                        feedback.build(sample_rate),
+                        mix.build(sample_rate),
+                        ping_pong,
+                        init_l,
+                        init_r,
+                        sample_rate,
+                    )))
                 }
                 SocketContent::Output => AudioNode::Output,
             };
@@ -965,10 +1289,18 @@ impl Song {
                             audio_graph.process_event(&event);
                         }
 
-                        let sample = audio_graph.next_sample(sample_rate);
+                        let out = audio_graph.next_sample(sample_rate);
 
-                        for ch in 0..channels {
-                            data[frame * channels + ch] = sample;
+                        // Map the stereo frame onto the device's channels:
+                        // mono device → downmix; otherwise even channels get L,
+                        // odd channels get R.
+                        let base = frame * channels;
+                        if channels == 1 {
+                            data[base] = (out.l + out.r) * 0.5;
+                        } else {
+                            for ch in 0..channels {
+                                data[base + ch] = if ch % 2 == 0 { out.l } else { out.r };
+                            }
                         }
                     }
 

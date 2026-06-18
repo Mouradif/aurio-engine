@@ -17,14 +17,24 @@ song:sampler(0, {
   root = "c3",
 }, { label = "Piano" })
 
--- A little reverb to taste, then out.
+-- A little reverb to taste, then an auto-panner, then out.
 song:effect(10, "Reverb", { delay = 0.35, feedback = 0.30, mix = 0.35 }, { label = "verb" })
 song:effect(11, "Gain",   { level = 0.7 },                               { label = "gain" })
+
+-- Pan is a stereo effect: amount -1 (full left) .. +1 (full right). Here the
+-- amount is driven by a sine LFO instead of a constant, so the piano slowly
+-- sweeps left↔right once every 4 seconds (freq = 0.25 Hz). Any param can take
+-- a modulator table like this — sine / triangle / ramp / square.
+song:effect(12, "Pan", {
+  amount = { name = "sine", freq = 0.25, low = -1, high = 1 },
+}, { label = "autopan" })
+
 song:output(99, { label = "main" })
 
-song:connection("Piano", "verb")
-song:connection("verb",  "gain")
-song:connection("gain",  "main")
+song:connection("Piano",   "verb")
+song:connection("verb",    "gain")
+song:connection("gain",    "autopan")
+song:connection("autopan", "main")
 
 -- An arpeggiated phrase that wanders well above and below the c3 root so the
 -- pitch-shifting is clearly audible. `pitch` accepts either a note-name string

@@ -1,5 +1,6 @@
 use crate::{
     effect::Effect,
+    frame::Frame,
     instrument::Instrument,
     midi::{EventKind, ScheduledEvent},
 };
@@ -19,7 +20,7 @@ pub struct AudioGraph {
     pub nodes: Vec<AudioNode>,
     pub edges: Vec<Edge>,
     pub order: Vec<usize>,
-    pub buffers: Vec<f32>,
+    pub buffers: Vec<Frame>,
 }
 
 impl AudioGraph {
@@ -35,7 +36,7 @@ impl AudioGraph {
                 nodes,
                 edges,
                 order,
-                buffers: vec![0.0; num_nodes],
+                buffers: vec![Frame::SILENCE; num_nodes],
             }),
             Err(msg) => Err(msg),
         }
@@ -64,9 +65,9 @@ impl AudioGraph {
         }
     }
 
-    pub fn next_sample(&mut self, sample_rate: f32) -> f32 {
+    pub fn next_sample(&mut self, sample_rate: f32) -> Frame {
         for &node_idx in &self.order {
-            let input: f32 = self
+            let input: Frame = self
                 .edges
                 .iter()
                 .filter(|e| e.to == node_idx)

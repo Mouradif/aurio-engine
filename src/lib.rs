@@ -1,8 +1,10 @@
 pub mod audio_graph;
 pub mod effect;
+pub mod frame;
 pub mod instrument;
 pub mod midi;
 pub mod oscillator;
+pub mod param;
 pub mod phrase;
 pub mod phrase_script;
 pub mod project;
