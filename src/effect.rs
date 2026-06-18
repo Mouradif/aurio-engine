@@ -7,6 +7,15 @@ use crate::param::Param;
 pub trait Effect {
     fn process(&mut self, frame: Frame) -> Frame;
     fn set_param(&mut self, _idx: u8, _value: f32) {}
+
+    /// Process a block of frames in place. The default impl drives `process`
+    /// per frame; native effects can leave it. Plugin wrappers (later) override
+    /// this to feed the host a real buffer.
+    fn process_block(&mut self, block: &mut [Frame]) {
+        for slot in block.iter_mut() {
+            *slot = self.process(*slot);
+        }
+    }
 }
 
 /// One-pole low-pass smoother for parameter values. Avoids zipper noise

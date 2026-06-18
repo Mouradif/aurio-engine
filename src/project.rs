@@ -1,4 +1,5 @@
-use crate::audio_graph::{AudioGraph, AudioNode};
+use crate::audio_graph::{AudioGraph, AudioNode, MAX_BLOCK};
+use crate::frame::Frame;
 use crate::effect::{
     Bitcrusher, Delay, Distortion, Gain, Highpass, Lowpass, Pan, Reverb, Tremolo,
 };
@@ -1300,6 +1301,11 @@ impl Song {
 
         let cpal_config: cpal::StreamConfig = stream_config.into();
 
+        // Stereo scratch the graph renders into, one slot per device frame.
+        // Pre-allocated to MAX_BLOCK so the callback never allocates; longer
+        // device buffers are processed in MAX_BLOCK-sized chunks.
+        let mut block_scratch = vec![Frame::SILENCE; MAX_BLOCK];
+
         let stream = device
             .build_output_stream(
                 &cpal_config,
@@ -1307,37 +1313,59 @@ impl Song {
                     let current = audio_counter.load(Ordering::Relaxed);
                     let num_frames = data.len() / channels;
 
-                    for frame in 0..num_frames {
-                        let frame_sample = current + frame as u64;
+                    // `pos` is the frame offset within this callback we've
+                    // rendered up to. We process variable-length segments, each
+                    // bounded by the next pending event and by MAX_BLOCK, so
+                    // events land sample-accurately at a block boundary.
+                    let mut pos = 0usize;
+                    while pos < num_frames {
+                        let seg_start_sample = current + pos as u64;
 
+                        // Apply every event due at or before this segment's first
+                        // sample. Draining here (rather than mid-segment) is what
+                        // pins each event to a block boundary.
                         while notes_consumer
                             .first()
-                            .is_some_and(|e| e.sample <= frame_sample)
+                            .is_some_and(|e| e.sample <= seg_start_sample)
                         {
                             let event = notes_consumer.try_pop().unwrap();
                             audio_graph.process_event(&event);
                         }
                         while params_consumer
                             .first()
-                            .is_some_and(|e| e.sample <= frame_sample)
+                            .is_some_and(|e| e.sample <= seg_start_sample)
                         {
                             let event = params_consumer.try_pop().unwrap();
                             audio_graph.process_event(&event);
                         }
 
-                        let out = audio_graph.next_sample(sample_rate);
+                        // Segment length: up to the next event, capped at the
+                        // remaining frames and MAX_BLOCK.
+                        let remaining = num_frames - pos;
+                        let until_event = next_event_sample(&notes_consumer, &params_consumer)
+                            .map(|s| s.saturating_sub(seg_start_sample) as usize)
+                            .filter(|&d| d > 0)
+                            .unwrap_or(remaining);
+                        let seg_len = until_event.min(remaining).min(MAX_BLOCK);
 
-                        // Map the stereo frame onto the device's channels:
+                        let seg = &mut block_scratch[..seg_len];
+                        audio_graph.process_block(seg, sample_rate);
+
+                        // Interleave the segment onto the device's channels:
                         // mono device → downmix; otherwise even channels get L,
                         // odd channels get R.
-                        let base = frame * channels;
-                        if channels == 1 {
-                            data[base] = (out.l + out.r) * 0.5;
-                        } else {
-                            for ch in 0..channels {
-                                data[base + ch] = if ch % 2 == 0 { out.l } else { out.r };
+                        for (i, out) in seg.iter().enumerate() {
+                            let base = (pos + i) * channels;
+                            if channels == 1 {
+                                data[base] = (out.l + out.r) * 0.5;
+                            } else {
+                                for ch in 0..channels {
+                                    data[base + ch] = if ch % 2 == 0 { out.l } else { out.r };
+                                }
                             }
                         }
+
+                        pos += seg_len;
                     }
 
                     audio_counter.fetch_add(num_frames as u64, Ordering::Relaxed);
@@ -1351,6 +1379,22 @@ impl Song {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    }
+}
+
+/// Earliest `sample` among the front events of the notes and params consumers,
+/// without popping either. Used to bound the next render segment so an event
+/// never fires mid-block. `None` when both queues are empty.
+fn next_event_sample<N, P>(notes: &N, params: &P) -> Option<u64>
+where
+    N: Consumer<Item = ScheduledEvent>,
+    P: Consumer<Item = ScheduledEvent>,
+{
+    let n = notes.first().map(|e| e.sample);
+    let p = params.first().map(|e| e.sample);
+    match (n, p) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 

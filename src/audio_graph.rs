@@ -5,6 +5,12 @@ use crate::{
     midi::{EventKind, ScheduledEvent},
 };
 
+/// Largest block the graph will process in a single `process_block` call.
+/// Per-node scratch buffers are pre-allocated to this size so the audio
+/// callback never allocates. It's a ceiling, not a processing contract: the
+/// callback splits any longer request into `MAX_BLOCK`-sized chunks.
+pub const MAX_BLOCK: usize = 4096;
+
 pub enum AudioNode {
     Source(Box<dyn Instrument + Send>),
     Processor(Box<dyn Effect + Send>),
@@ -20,7 +26,11 @@ pub struct AudioGraph {
     pub nodes: Vec<AudioNode>,
     pub edges: Vec<Edge>,
     pub order: Vec<usize>,
-    pub buffers: Vec<Frame>,
+    /// Per-node output scratch, each `MAX_BLOCK` frames long. A node writes its
+    /// block here; downstream nodes read it via their incoming edges.
+    buffers: Vec<Vec<Frame>>,
+    /// Reusable mix scratch for summing a node's inputs, `MAX_BLOCK` long.
+    mix_scratch: Vec<Frame>,
 }
 
 impl AudioGraph {
@@ -36,7 +46,8 @@ impl AudioGraph {
                 nodes,
                 edges,
                 order,
-                buffers: vec![Frame::SILENCE; num_nodes],
+                buffers: vec![vec![Frame::SILENCE; MAX_BLOCK]; num_nodes],
+                mix_scratch: vec![Frame::SILENCE; MAX_BLOCK],
             }),
             Err(msg) => Err(msg),
         }
@@ -65,29 +76,49 @@ impl AudioGraph {
         }
     }
 
-    pub fn next_sample(&mut self, sample_rate: f32) -> Frame {
+    /// Process `out.len()` frames through the whole graph, writing the summed
+    /// output of every `Output` node into `out`. `out.len()` must be
+    /// `<= MAX_BLOCK` (callers chunk longer requests). No allocation occurs.
+    pub fn process_block(&mut self, out: &mut [Frame], sample_rate: f32) {
+        let n = out.len();
+        debug_assert!(n <= MAX_BLOCK, "block of {n} exceeds MAX_BLOCK {MAX_BLOCK}");
+
         for &node_idx in &self.order {
-            let input: Frame = self
-                .edges
-                .iter()
-                .filter(|e| e.to == node_idx)
-                .map(|e| self.buffers[e.from])
-                .sum();
+            // Sum this node's inputs into mix_scratch (immutable reads of the
+            // upstream buffers, which are already filled — topo order guarantees
+            // it). Sources have no inputs, so mix stays silent for them.
+            let mix = &mut self.mix_scratch[..n];
+            mix.fill(Frame::SILENCE);
+            for edge in &self.edges {
+                if edge.to == node_idx {
+                    let src = &self.buffers[edge.from][..n];
+                    for (m, s) in mix.iter_mut().zip(src) {
+                        *m += *s;
+                    }
+                }
+            }
 
-            let output = match &mut self.nodes[node_idx] {
-                AudioNode::Source(instrument) => instrument.next_sample(sample_rate),
-                AudioNode::Processor(effect) => effect.process(input),
-                AudioNode::Output => input,
-            };
-
-            self.buffers[node_idx] = output;
+            // Process into the node's own output buffer.
+            let dst = &mut self.buffers[node_idx][..n];
+            match &mut self.nodes[node_idx] {
+                AudioNode::Source(instrument) => instrument.render_block(dst, sample_rate),
+                AudioNode::Processor(effect) => {
+                    dst.copy_from_slice(&self.mix_scratch[..n]);
+                    effect.process_block(dst);
+                }
+                AudioNode::Output => dst.copy_from_slice(&self.mix_scratch[..n]),
+            }
         }
 
-        self.order
-            .iter()
-            .filter(|&&idx| matches!(self.nodes[idx], AudioNode::Output))
-            .map(|&idx| self.buffers[idx])
-            .sum()
+        // Sum every Output node's buffer into `out`.
+        out.fill(Frame::SILENCE);
+        for &idx in &self.order {
+            if matches!(self.nodes[idx], AudioNode::Output) {
+                for (o, s) in out.iter_mut().zip(&self.buffers[idx][..n]) {
+                    *o += *s;
+                }
+            }
+        }
     }
 }
 
