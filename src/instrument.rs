@@ -15,4 +15,9 @@ pub trait Instrument {
             *slot = self.next_sample(sample_rate);
         }
     }
+
+    /// Stage a parameter change addressed by a CLAP param id. Default no-op;
+    /// only plugin instrument nodes override it.
+    #[cfg(feature = "clap-host")]
+    fn set_param_by_id(&mut self, _param_id: u32, _value: f32) {}
 }

@@ -73,6 +73,20 @@ impl AudioGraph {
                     effect.set_param(*param_idx, *value);
                 }
             }
+            // A plugin node may be either a Source or a Processor, so route to
+            // whichever it is.
+            #[cfg(feature = "clap-host")]
+            EventKind::SetPluginParam {
+                node_idx,
+                param_id,
+                value,
+            } => match self.nodes.get_mut(*node_idx) {
+                Some(AudioNode::Processor(effect)) => effect.set_param_by_id(*param_id, *value),
+                Some(AudioNode::Source(instrument)) => {
+                    instrument.set_param_by_id(*param_id, *value)
+                }
+                _ => {}
+            },
         }
     }
 

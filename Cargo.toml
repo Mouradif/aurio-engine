@@ -3,9 +3,15 @@ name = "aurio"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# CLAP plugin hosting. Off by default so the core engine stays free of the
+# dynamic-loading machinery and FFI surface.
+clap-host = ["dep:libloading"]
+
 [dependencies]
 cpal = "0.17.3"
 hound = "3.5"
 midir = "0.11"
 mlua = { version = "0.11.6", features = ["lua54", "send"] }
 ringbuf = "0.4.8"
+libloading = { version = "0.8", optional = true }

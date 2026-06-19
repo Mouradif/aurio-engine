@@ -33,6 +33,8 @@ pub struct Song {
     phrases: HashMap<String, PhraseSpec>,
     tracks: Vec<TrackSpec>,
     pending_bindings: Vec<PendingBinding>,
+    #[cfg(feature = "clap-host")]
+    pending_plugin_bindings: Vec<PendingPluginBinding>,
 }
 
 struct SocketEntry {
@@ -49,6 +51,17 @@ enum SocketContent {
         zones: Vec<SamplerZoneSpec>,
     },
     Effect(EffectSpec),
+    /// A CLAP plugin loaded from a `.clap` bundle, used as an instrument
+    /// (source) or an effect (processor) depending on `is_instrument`.
+    #[cfg(feature = "clap-host")]
+    Plugin {
+        path: String,
+        plugin_id: String,
+        is_instrument: bool,
+        /// Initial values for named params, plus any MIDI bindings (recorded
+        /// separately in `pending_plugin_bindings`).
+        params: Vec<(String, f32)>,
+    },
     Output,
 }
 
@@ -164,6 +177,29 @@ struct ResolvedBinding {
     param_idx: u8,
 }
 
+/// A MIDI binding onto a plugin parameter, addressed by *name* at Lua-eval time.
+/// Resolved to `(node_idx, clap param id)` once the plugin is loaded and its
+/// params are discovered.
+#[cfg(feature = "clap-host")]
+#[derive(Clone)]
+struct PendingPluginBinding {
+    cc: u8,
+    channel: Option<u8>,
+    range: (f32, f32),
+    socket_id: u32,
+    param_name: String,
+}
+
+#[cfg(feature = "clap-host")]
+#[derive(Clone)]
+struct ResolvedPluginBinding {
+    cc: u8,
+    channel: Option<u8>,
+    range: (f32, f32),
+    node_idx: usize,
+    param_id: u32,
+}
+
 #[derive(Default)]
 struct SongBuilder {
     bpm: Option<f32>,
@@ -177,6 +213,8 @@ struct SongBuilder {
     tracks: Vec<TrackSpec>,
     socket_ids: HashSet<u32>,
     pending_bindings: Vec<PendingBinding>,
+    #[cfg(feature = "clap-host")]
+    pending_plugin_bindings: Vec<PendingPluginBinding>,
 }
 
 impl SongBuilder {
@@ -822,6 +860,95 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
         )?;
     }
 
+    #[cfg(feature = "clap-host")]
+    {
+        let b = builder.clone();
+        song.set(
+            "plugin",
+            lua.create_function(
+                move |_,
+                      (_self, id, path, opts, label_opts): (
+                    Value,
+                    u32,
+                    String,
+                    Table,
+                    Option<Table>,
+                )| {
+                    let plugin_id: String = opts.get("id")?;
+                    let is_instrument: bool = opts.get::<Option<bool>>("instrument")?.unwrap_or(true);
+                    // Label lives in the trailing opts table (like other sockets),
+                    // but also accept `label` inside the main opts table for
+                    // convenience.
+                    let label = match label_from_opts(label_opts)? {
+                        Some(l) => Some(l),
+                        None => opts.get::<Option<String>>("label")?,
+                    };
+
+                    let mut guard = b.lock().unwrap();
+                    let builder = guard.as_mut().unwrap();
+
+                    // Resolve the .clap path relative to the song file's dir.
+                    let resolved = {
+                        let p = std::path::Path::new(&path);
+                        if p.is_absolute() {
+                            p.to_path_buf()
+                        } else {
+                            builder.base_dir.join(p)
+                        }
+                    };
+
+                    // Parse the params table: each entry is either a number
+                    // (initial value) or a midi_connect() handle (recorded as a
+                    // pending plugin binding, with its initial used as the value).
+                    let mut params: Vec<(String, f32)> = Vec::new();
+                    if let Some(params_t) = opts.get::<Option<Table>>("params")? {
+                        for pair in params_t.pairs::<String, Value>() {
+                            let (name, value) = pair?;
+                            match value {
+                                Value::Number(n) => params.push((name, n as f32)),
+                                Value::Integer(i) => params.push((name, i as f32)),
+                                Value::UserData(ud) => {
+                                    let live = ud.borrow::<LiveParam>().map_err(|_| {
+                                        mlua::Error::RuntimeError(format!(
+                                            "plugin param '{}' has unknown userdata (expected midi_connect handle)",
+                                            name
+                                        ))
+                                    })?;
+                                    builder.pending_plugin_bindings.push(PendingPluginBinding {
+                                        cc: live.cc,
+                                        channel: live.channel,
+                                        range: live.range,
+                                        socket_id: id,
+                                        param_name: name.clone(),
+                                    });
+                                    params.push((name, live.initial));
+                                }
+                                _ => {
+                                    return Err(mlua::Error::RuntimeError(format!(
+                                        "plugin param '{}' must be a number or midi_connect handle",
+                                        name
+                                    )));
+                                }
+                            }
+                        }
+                    }
+
+                    builder.add_socket(
+                        id,
+                        SocketContent::Plugin {
+                            path: resolved.to_string_lossy().into_owned(),
+                            plugin_id,
+                            is_instrument,
+                            params,
+                        },
+                        label,
+                    )?;
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
     {
         let b = builder.clone();
         song.set(
@@ -1052,6 +1179,8 @@ impl Song {
             phrases: state.phrases,
             tracks: state.tracks,
             pending_bindings: state.pending_bindings,
+            #[cfg(feature = "clap-host")]
+            pending_plugin_bindings: state.pending_plugin_bindings,
         })
     }
 
@@ -1075,10 +1204,16 @@ impl Song {
             phrases,
             tracks,
             pending_bindings,
+            #[cfg(feature = "clap-host")]
+            pending_plugin_bindings,
         } = self;
 
         let mut audio_nodes: Vec<AudioNode> = Vec::new();
         let mut socket_to_node: HashMap<u32, usize> = HashMap::new();
+        // socket id → (lowercased param name → CLAP param id), captured while
+        // building plugin nodes so name-based MIDI bindings can be resolved.
+        #[cfg(feature = "clap-host")]
+        let mut plugin_param_ids: HashMap<u32, HashMap<String, u32>> = HashMap::new();
 
         for socket in sockets {
             let node = match socket.content {
@@ -1180,6 +1315,89 @@ impl Song {
                         sample_rate,
                     )))
                 }
+                #[cfg(feature = "clap-host")]
+                SocketContent::Plugin {
+                    path,
+                    plugin_id,
+                    is_instrument,
+                    params,
+                } => {
+                    match crate::clap::PluginNode::load(
+                        socket.id as usize,
+                        std::path::Path::new(&path),
+                        &plugin_id,
+                        sample_rate,
+                    ) {
+                        Ok(mut node) => {
+                            // Record the param name→id map for binding resolution.
+                            let mut name_to_id = HashMap::new();
+                            for p in node.params() {
+                                name_to_id.insert(p.name.to_lowercase(), p.id);
+                            }
+                            plugin_param_ids.insert(socket.id, name_to_id);
+
+                            // `AURIO_DUMP_PARAMS=1` lists every param the plugin
+                            // exposes, so bindings can be matched to real names.
+                            if std::env::var("AURIO_DUMP_PARAMS").is_ok() {
+                                println!(
+                                    "[plugin] socket {}: '{}' exposes {} params:",
+                                    socket.id,
+                                    node.name(),
+                                    node.params().len()
+                                );
+                                for p in node.params() {
+                                    println!(
+                                        "    \"{}\"  [{:.3} .. {:.3}, default {:.3}]",
+                                        p.name, p.min, p.max, p.default
+                                    );
+                                }
+                            }
+
+                            // Apply declared initial param values by name.
+                            for (name, value) in &params {
+                                if let Some(pid) = node.param_id_by_name(name) {
+                                    if is_instrument {
+                                        crate::instrument::Instrument::set_param_by_id(
+                                            &mut node, pid, *value,
+                                        );
+                                    } else {
+                                        crate::effect::Effect::set_param_by_id(
+                                            &mut node, pid, *value,
+                                        );
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "[plugin] socket {}: '{}' has no param named '{}'",
+                                        socket.id,
+                                        node.name(),
+                                        name
+                                    );
+                                }
+                            }
+
+                            println!("[plugin] loaded '{}' for socket {}", node.name(), socket.id);
+                            if is_instrument {
+                                AudioNode::Source(Box::new(node))
+                            } else {
+                                AudioNode::Processor(Box::new(node))
+                            }
+                        }
+                        Err(e) => {
+                            // Skip-and-warn: keep the rest of the song playing.
+                            // Instruments become silence; effects become a
+                            // transparent pass-through.
+                            eprintln!(
+                                "[plugin] socket {}: failed to load '{}' ({}): {}",
+                                socket.id, path, plugin_id, e
+                            );
+                            if is_instrument {
+                                AudioNode::Source(Box::new(SilentSource::new(socket.id as usize)))
+                            } else {
+                                AudioNode::Processor(Box::new(Passthrough))
+                            }
+                        }
+                    }
+                }
                 SocketContent::Output => AudioNode::Output,
             };
             let idx = audio_nodes.len();
@@ -1270,6 +1488,36 @@ impl Song {
             })
             .collect();
 
+        // Resolve plugin param bindings: map each param *name* to its CLAP id
+        // using the map captured at load. A name that doesn't match a real param
+        // (or a plugin that failed to load) is warned about and skipped.
+        #[cfg(feature = "clap-host")]
+        let resolved_plugin_bindings: Vec<ResolvedPluginBinding> = pending_plugin_bindings
+            .into_iter()
+            .filter_map(|b| {
+                let &node_idx = socket_to_node.get(&b.socket_id)?;
+                let param_id = plugin_param_ids
+                    .get(&b.socket_id)
+                    .and_then(|m| m.get(&b.param_name.to_lowercase()).copied());
+                match param_id {
+                    Some(param_id) => Some(ResolvedPluginBinding {
+                        cc: b.cc,
+                        channel: b.channel,
+                        range: b.range,
+                        node_idx,
+                        param_id,
+                    }),
+                    None => {
+                        eprintln!(
+                            "[plugin] socket {}: midi binding references unknown param '{}'",
+                            b.socket_id, b.param_name
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
         // Two ring buffers feed the audio thread:
         //   notes_rb  — produced by the timing thread
         //   params_rb — produced by the MIDI input thread (if any bindings exist)
@@ -1295,8 +1543,19 @@ impl Song {
             );
         });
 
-        if !resolved_bindings.is_empty() {
-            spawn_midi_thread(resolved_bindings, params_producer, sample_counter.clone());
+        #[cfg(not(feature = "clap-host"))]
+        let has_plugin_bindings = false;
+        #[cfg(feature = "clap-host")]
+        let has_plugin_bindings = !resolved_plugin_bindings.is_empty();
+
+        if !resolved_bindings.is_empty() || has_plugin_bindings {
+            spawn_midi_thread(
+                resolved_bindings,
+                #[cfg(feature = "clap-host")]
+                resolved_plugin_bindings,
+                params_producer,
+                sample_counter.clone(),
+            );
         }
 
         let cpal_config: cpal::StreamConfig = stream_config.into();
@@ -1382,6 +1641,39 @@ impl Song {
     }
 }
 
+/// Fallback nodes used when a CLAP plugin fails to load, so the rest of the
+/// song still plays: an instrument becomes silence, an effect becomes a
+/// transparent pass-through.
+#[cfg(feature = "clap-host")]
+struct SilentSource {
+    id: usize,
+}
+#[cfg(feature = "clap-host")]
+impl SilentSource {
+    fn new(id: usize) -> Self {
+        Self { id }
+    }
+}
+#[cfg(feature = "clap-host")]
+impl crate::instrument::Instrument for SilentSource {
+    fn id(&self) -> usize {
+        self.id
+    }
+    fn process_event(&mut self, _event: &crate::midi::NoteEvent) {}
+    fn next_sample(&mut self, _sample_rate: f32) -> Frame {
+        Frame::SILENCE
+    }
+}
+
+#[cfg(feature = "clap-host")]
+struct Passthrough;
+#[cfg(feature = "clap-host")]
+impl crate::effect::Effect for Passthrough {
+    fn process(&mut self, frame: Frame) -> Frame {
+        frame
+    }
+}
+
 /// Earliest `sample` among the front events of the notes and params consumers,
 /// without popping either. Used to bound the next render segment so an event
 /// never fires mid-block. `None` when both queues are empty.
@@ -1404,6 +1696,7 @@ where
 /// `MidiInputConnection` (and its callback closure) alive.
 fn spawn_midi_thread(
     bindings: Vec<ResolvedBinding>,
+    #[cfg(feature = "clap-host")] plugin_bindings: Vec<ResolvedPluginBinding>,
     mut producer: HeapProd<ScheduledEvent>,
     audio_counter: Arc<AtomicU64>,
 ) {
@@ -1448,6 +1741,20 @@ fn spawn_midi_thread(
                                 value,
                             );
                             // Drop on overflow — knob noise is fine to lose.
+                            let _ = producer.try_push(event);
+                        }
+                    }
+
+                    #[cfg(feature = "clap-host")]
+                    for b in &plugin_bindings {
+                        if b.cc == cc && b.channel.is_none_or(|c| c == channel) {
+                            let value = b.range.0 + raw * (b.range.1 - b.range.0);
+                            let event = ScheduledEvent::set_plugin_param(
+                                audio_counter.load(Ordering::Relaxed),
+                                b.node_idx,
+                                b.param_id,
+                                value,
+                            );
                             let _ = producer.try_push(event);
                         }
                     }

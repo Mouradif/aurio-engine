@@ -16,6 +16,11 @@ pub trait Effect {
             *slot = self.process(*slot);
         }
     }
+
+    /// Stage a parameter change addressed by a CLAP param id. Default no-op;
+    /// only plugin effect nodes override it.
+    #[cfg(feature = "clap-host")]
+    fn set_param_by_id(&mut self, _param_id: u32, _value: f32) {}
 }
 
 /// One-pole low-pass smoother for parameter values. Avoids zipper noise

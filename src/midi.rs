@@ -26,6 +26,14 @@ pub enum EventKind {
         param_idx: u8,
         value: f32,
     },
+    /// Parameter automation for a CLAP plugin node, addressed by the plugin's
+    /// stable param id (not the u8 index native effects use).
+    #[cfg(feature = "clap-host")]
+    SetPluginParam {
+        node_idx: usize,
+        param_id: u32,
+        value: f32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +56,18 @@ impl ScheduledEvent {
             kind: EventKind::SetParam {
                 node_idx,
                 param_idx,
+                value,
+            },
+        }
+    }
+
+    #[cfg(feature = "clap-host")]
+    pub fn set_plugin_param(sample: u64, node_idx: usize, param_id: u32, value: f32) -> Self {
+        Self {
+            sample,
+            kind: EventKind::SetPluginParam {
+                node_idx,
+                param_id,
                 value,
             },
         }
