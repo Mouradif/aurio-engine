@@ -16,8 +16,8 @@ pub trait Instrument {
         }
     }
 
-    /// Stage a parameter change addressed by a CLAP param id. Default no-op;
-    /// only plugin instrument nodes override it.
-    #[cfg(feature = "clap-host")]
+    /// Stage a parameter change addressed by a plugin param id. Default no-op;
+    /// only plugin instrument nodes (CLAP/LV2) override it.
+    #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
     fn set_param_by_id(&mut self, _param_id: u32, _value: f32) {}
 }

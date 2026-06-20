@@ -39,88 +39,102 @@ enum StagedEvent {
     },
 }
 
-/// Backing storage for the `clap_input_events` vtable. The plugin calls
-/// `size`/`get` through the vtable during `process()`; `get` returns a pointer
-/// to a freshly materialized event struct held in `scratch`. Because the plugin
-/// only reads each pointer transiently within the call, a single reused scratch
-/// slot per kind is sufficient.
+/// A fully materialized CLAP event with stable storage. A plugin may hold the
+/// pointers returned by `ev_get` for the duration of `process()` and read them
+/// in any order, so every event needs its *own* live struct (not a shared
+/// scratch slot). These are kept in `EventList::materialized`.
+union MaterializedEvent {
+    header: clap_event_header,
+    note: clap_event_note,
+    param: clap_event_param_value,
+}
+
+/// Backing storage for the `clap_input_events` vtable. `staged` accumulates
+/// events as the host/graph produces them; `materialize()` converts them into
+/// `materialized` (stable per-event storage) right before `process()`.
 struct EventList {
-    events: Vec<StagedEvent>,
-    // Reused storage the `get` callback writes into and returns a pointer to.
-    note_scratch: clap_event_note,
-    param_scratch: clap_event_param_value,
+    staged: Vec<StagedEvent>,
+    materialized: Vec<MaterializedEvent>,
 }
 
 impl EventList {
     fn new() -> Self {
         EventList {
-            events: Vec::with_capacity(256),
-            note_scratch: unsafe { std::mem::zeroed() },
-            param_scratch: unsafe { std::mem::zeroed() },
+            staged: Vec::with_capacity(256),
+            materialized: Vec::with_capacity(256),
+        }
+    }
+
+    /// Build the stable CLAP event structs from the staged list. Called once
+    /// per `process()` so all `ev_get` pointers remain valid simultaneously.
+    fn materialize(&mut self) {
+        self.materialized.clear();
+        for ev in &self.staged {
+            let m = match *ev {
+                StagedEvent::Note {
+                    time,
+                    type_,
+                    key,
+                    velocity,
+                } => MaterializedEvent {
+                    note: clap_event_note {
+                        header: clap_event_header {
+                            size: std::mem::size_of::<clap_event_note>() as u32,
+                            time,
+                            space_id: CLAP_CORE_EVENT_SPACE_ID,
+                            type_,
+                            flags: CLAP_EVENT_IS_LIVE,
+                        },
+                        note_id: -1,
+                        port_index: 0,
+                        channel: 0,
+                        key,
+                        velocity,
+                    },
+                },
+                StagedEvent::Param {
+                    time,
+                    param_id,
+                    value,
+                } => MaterializedEvent {
+                    param: clap_event_param_value {
+                        header: clap_event_header {
+                            size: std::mem::size_of::<clap_event_param_value>() as u32,
+                            time,
+                            space_id: CLAP_CORE_EVENT_SPACE_ID,
+                            type_: CLAP_EVENT_PARAM_VALUE,
+                            flags: 0,
+                        },
+                        param_id,
+                        cookie: std::ptr::null_mut(),
+                        note_id: -1,
+                        port_index: -1,
+                        channel: -1,
+                        key: -1,
+                        value,
+                    },
+                },
+            };
+            self.materialized.push(m);
         }
     }
 }
 
 unsafe extern "C" fn ev_size(list: *const clap_input_events) -> u32 {
     let el = unsafe { &*((*list).ctx as *const EventList) };
-    el.events.len() as u32
+    el.materialized.len() as u32
 }
 
 unsafe extern "C" fn ev_get(
     list: *const clap_input_events,
     index: u32,
 ) -> *const clap_event_header {
-    // ctx is *mut so we can write into the reused scratch slots.
-    let el = unsafe { &mut *((*list).ctx as *mut EventList) };
-    let Some(ev) = el.events.get(index as usize).copied() else {
-        return std::ptr::null();
-    };
-    match ev {
-        StagedEvent::Note {
-            time,
-            type_,
-            key,
-            velocity,
-        } => {
-            el.note_scratch = clap_event_note {
-                header: clap_event_header {
-                    size: std::mem::size_of::<clap_event_note>() as u32,
-                    time,
-                    space_id: CLAP_CORE_EVENT_SPACE_ID,
-                    type_,
-                    flags: CLAP_EVENT_IS_LIVE,
-                },
-                note_id: -1,
-                port_index: 0,
-                channel: 0,
-                key,
-                velocity,
-            };
-            &el.note_scratch as *const _ as *const clap_event_header
-        }
-        StagedEvent::Param {
-            time,
-            param_id,
-            value,
-        } => {
-            el.param_scratch = clap_event_param_value {
-                header: clap_event_header {
-                    size: std::mem::size_of::<clap_event_param_value>() as u32,
-                    time,
-                    space_id: CLAP_CORE_EVENT_SPACE_ID,
-                    type_: CLAP_EVENT_PARAM_VALUE,
-                    flags: CLAP_EVENT_IS_LIVE | CLAP_EVENT_DONT_RECORD,
-                },
-                param_id,
-                cookie: std::ptr::null_mut(),
-                note_id: -1,
-                port_index: -1,
-                channel: -1,
-                key: -1,
-                value,
-            };
-            &el.param_scratch as *const _ as *const clap_event_header
-        }
+    let el = unsafe { &*((*list).ctx as *const EventList) };
+    match el.materialized.get(index as usize) {
+        // SAFETY: every variant begins with a `clap_event_header` (repr(C)),
+        // so reading `.header` is valid regardless of the actual event type.
+        Some(m) => unsafe { &m.header as *const clap_event_header },
+        None => std::ptr::null(),
     }
 }
 
@@ -231,6 +245,10 @@ impl PluginNode {
             constant_mask: 0,
         };
 
+        // Materialize staged events into stable storage so every `ev_get`
+        // pointer the plugin reads during process() stays valid at once.
+        self.events.materialize();
+
         let in_events = clap_input_events {
             ctx: self.events.as_mut() as *mut EventList as *mut c_void,
             size: Some(ev_size),
@@ -274,7 +292,7 @@ impl PluginNode {
             }
         }
 
-        self.events.events.clear();
+        self.events.staged.clear();
         self.steady += n as i64;
     }
 
@@ -309,7 +327,7 @@ impl PluginNode {
                 velocity: 0.0,
             },
         };
-        self.events.events.push(staged);
+        self.events.staged.push(staged);
     }
 }
 
@@ -371,7 +389,7 @@ impl Effect for PluginNode {
 impl PluginNode {
     /// Stage a parameter change by CLAP id, applied at the next `process()`.
     fn stage_param(&mut self, param_id: clap_id, value: f32) {
-        self.events.events.push(StagedEvent::Param {
+        self.events.staged.push(StagedEvent::Param {
             time: 0,
             param_id,
             value: value as f64,

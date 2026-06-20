@@ -4,6 +4,8 @@ pub mod clap;
 pub mod effect;
 pub mod frame;
 pub mod instrument;
+#[cfg(feature = "lv2-host")]
+pub mod lv2;
 pub mod midi;
 pub mod oscillator;
 pub mod param;

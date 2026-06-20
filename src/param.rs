@@ -79,6 +79,23 @@ impl ModState {
 
         low + unipolar * (high - low)
     }
+
+    /// Sample the value at the current phase, then advance the phase by `frames`
+    /// frames in one step. Used to drive plugin parameters once per processing
+    /// block: the value is held for the whole block while the phase stays
+    /// continuous over time. `frames` should be modest (the audio callback caps
+    /// segments at `MAX_BLOCK` and splits at events) to keep the LFO smooth.
+    pub fn next_block(&mut self, sample_rate: f32, frames: usize) -> f32 {
+        let (freq, low, high) = self.modulator.bounds();
+        let value = low + self.modulator.shape(self.phase) * (high - low);
+
+        self.phase += (freq / sample_rate).max(0.0) * frames as f32;
+        if self.phase >= 1.0 {
+            self.phase -= self.phase.floor();
+        }
+
+        value
+    }
 }
 
 /// A controllable parameter value. Either a constant (smoothed to avoid zipper

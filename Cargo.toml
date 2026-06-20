@@ -7,6 +7,9 @@ edition = "2024"
 # CLAP plugin hosting. Off by default so the core engine stays free of the
 # dynamic-loading machinery and FFI surface.
 clap-host = ["dep:libloading"]
+# LV2 plugin hosting. Hand-rolled C ABI + Atom/URID; sophia parses the Turtle
+# RDF manifests. Off by default.
+lv2-host = ["dep:libloading", "dep:sophia"]
 
 [dependencies]
 cpal = "0.17.3"
@@ -15,3 +18,4 @@ midir = "0.11"
 mlua = { version = "0.11.6", features = ["lua54", "send"] }
 ringbuf = "0.4.8"
 libloading = { version = "0.8", optional = true }
+sophia = { version = "0.10", optional = true }
