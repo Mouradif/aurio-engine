@@ -27,8 +27,8 @@ song:sampler(0, {
   },
 }, { label = "Piano" })
 
-song:effect(10, "Reverb", { delay = 0.40, feedback = 0.35, mix = 0.40 }, { label = "verb" })
-song:effect(11, "Gain",   { level = 0.7 },                               { label = "gain" })
+song:effect(10, { kind = "Reverb", label = "verb", params = { delay = 0.40, feedback = 0.35, mix = 0.40 } })
+song:effect(11, { kind = "Gain", label = "gain", params = { level = 0.7 } })
 song:output(99, { label = "main" })
 
 song:connection("Piano", "verb")

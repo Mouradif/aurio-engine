@@ -4,6 +4,7 @@ use crate::effect::{
     Bitcrusher, Delay, Distortion, Gain, Highpass, Lowpass, Pan, Reverb, Tremolo,
 };
 use crate::midi::{MidiNote, ScheduledEvent};
+use crate::organ::{Organ, OrganCharacter, Percussion, VibratoChorus};
 use crate::oscillator::{Oscillator, Wave};
 use crate::param::{Modulator, Param};
 use crate::phrase::{Phrase, PhraseEntry, PhraseHooks};
@@ -52,6 +53,7 @@ enum SocketContent {
     Sampler {
         zones: Vec<SamplerZoneSpec>,
     },
+    Organ(OrganSpec),
     Effect(EffectSpec),
     /// A CLAP plugin loaded from a `.clap` bundle, used as an instrument
     /// (source) or an effect (processor) depending on `is_instrument`.
@@ -74,6 +76,19 @@ enum SocketContent {
         params: Vec<(String, f32)>,
     },
     Output,
+}
+
+/// A tonewheel organ as declared in Lua: nine drawbar params (each may be a
+/// constant, an LFO, or a live `midi_connect` binding) plus the optional
+/// Hammond-isms (key click, percussion, scanner vibrato/chorus, and the
+/// leakage/drive/wobble character block).
+struct OrganSpec {
+    drawbars: [ParamSpec; 9],
+    gain: ParamSpec,
+    click: f32,
+    percussion: Option<Percussion>,
+    vibrato: Option<VibratoChorus>,
+    character: OrganCharacter,
 }
 
 /// One zone of a sampler, as declared in Lua: a WAV file (already resolved to
@@ -381,6 +396,222 @@ fn parse_modulator(name: &str, t: &Table) -> mlua::Result<Modulator> {
     })
 }
 
+/// Parse one organ param value that may be live: a number (constant), a
+/// modulator table, or a `midi_connect` handle (records a binding against
+/// this socket's `param_idx`, seeded at the handle's initial value).
+fn parse_organ_param(
+    v: Value,
+    what: &str,
+    socket_id: u32,
+    param_idx: u8,
+    builder: &mut SongBuilder,
+) -> mlua::Result<ParamSpec> {
+    match v {
+        Value::UserData(ud) => {
+            let live = ud.borrow::<LiveParam>().map_err(|_| {
+                mlua::Error::RuntimeError(format!(
+                    "{} has unknown userdata type (expected LiveParam from midi_connect)",
+                    what
+                ))
+            })?;
+            builder.pending_bindings.push(PendingBinding {
+                cc: live.cc,
+                channel: live.channel,
+                range: live.range,
+                socket_id,
+                param_idx,
+            });
+            Ok(ParamSpec::Const(live.initial))
+        }
+        other => parse_param_value(other, what),
+    }
+}
+
+/// Parse an organ declaration table:
+///   { drawbars = "88 8000 000",  -- 9 digits 0-8, separators ignored — or a
+///                                -- list of 9 values, each a number 0-8, a
+///                                -- modulator table, or midi_connect(...)
+///     gain = 0.8,                -- swell: number, modulator, or midi_connect
+///     click = 0.4,               -- key-click amount 0..1 (optional)
+///     percussion = { harmonic = 3, decay = "fast", volume = "soft" },
+///     vibrato = "C3",            -- V1-V3/C1-C3, or { rate=, depth=, mix= }
+///     leakage = 0.3, drive = 0.4, wobble = 0.5 }   -- character, all 0..1
+fn parse_organ_config(
+    config: &Table,
+    socket_id: u32,
+    builder: &mut SongBuilder,
+) -> mlua::Result<OrganSpec> {
+    let drawbars: [ParamSpec; 9] = match config.get::<Value>("drawbars")? {
+        Value::String(s) => {
+            let s = s.to_str()?.to_owned();
+            let digits: Vec<ParamSpec> = s
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '-')
+                .map(|c| {
+                    c.to_digit(10)
+                        .filter(|d| *d <= 8)
+                        .map(|d| ParamSpec::Const(d as f32))
+                        .ok_or_else(|| {
+                            mlua::Error::RuntimeError(format!(
+                                "organ drawbars must be digits 0-8, got '{}' in \"{}\"",
+                                c, s
+                            ))
+                        })
+                })
+                .collect::<mlua::Result<_>>()?;
+            digits.try_into().map_err(|v: Vec<ParamSpec>| {
+                mlua::Error::RuntimeError(format!(
+                    "organ drawbars needs exactly 9 digits (e.g. \"888000000\"), got {}",
+                    v.len()
+                ))
+            })?
+        }
+        Value::Table(list) => {
+            let mut bars = Vec::with_capacity(9);
+            for (i, v) in list.sequence_values::<Value>().enumerate() {
+                bars.push(parse_organ_param(
+                    v?,
+                    "organ drawbar",
+                    socket_id,
+                    Organ::PARAM_DRAWBAR_BASE + i as u8,
+                    builder,
+                )?);
+            }
+            bars.try_into().map_err(|v: Vec<ParamSpec>| {
+                mlua::Error::RuntimeError(format!(
+                    "organ drawbars list needs exactly 9 entries, got {}",
+                    v.len()
+                ))
+            })?
+        }
+        _ => {
+            return Err(mlua::Error::RuntimeError(
+                "organ 'drawbars' must be a 9-digit string or a list of 9 values".into(),
+            ));
+        }
+    };
+
+    let gain = match config.get::<Value>("gain")? {
+        Value::Nil => ParamSpec::Const(0.8),
+        v => parse_organ_param(v, "organ gain", socket_id, Organ::PARAM_GAIN, builder)?,
+    };
+    let click: f32 = config.get::<Option<f32>>("click")?.unwrap_or(0.3);
+
+    let percussion = match config.get::<Option<Table>>("percussion")? {
+        Some(t) => {
+            let harmonic: u8 = t.get::<Option<u8>>("harmonic")?.unwrap_or(3);
+            if harmonic != 2 && harmonic != 3 {
+                return Err(mlua::Error::RuntimeError(
+                    "organ percussion harmonic must be 2 or 3".into(),
+                ));
+            }
+            // The real switch is fast/slow; a number in seconds also works.
+            let decay = match t.get::<Value>("decay")? {
+                Value::Nil => 0.25,
+                Value::Number(n) => n as f32,
+                Value::Integer(i) => i as f32,
+                Value::String(s) => match s.to_str()?.as_ref() {
+                    "fast" => 0.25,
+                    "slow" => 1.0,
+                    other => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "organ percussion decay must be \"fast\", \"slow\" or seconds, got \"{}\"",
+                            other
+                        )));
+                    }
+                },
+                _ => {
+                    return Err(mlua::Error::RuntimeError(
+                        "organ percussion decay must be \"fast\", \"slow\" or seconds".into(),
+                    ));
+                }
+            };
+            // Normal/soft volume switch; an explicit `level` overrides it.
+            let volume = match t.get::<Option<String>>("volume")?.as_deref() {
+                None | Some("normal") => 0.7,
+                Some("soft") => 0.3,
+                Some(other) => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "organ percussion volume must be \"normal\" or \"soft\", got \"{}\"",
+                        other
+                    )));
+                }
+            };
+            let level = t.get::<Option<f32>>("level")?.unwrap_or(volume);
+            Some(Percussion::new(harmonic, decay, level))
+        }
+        None => None,
+    };
+
+    let vibrato = match config.get::<Value>("vibrato")? {
+        Value::Nil => None,
+        // The six-position switch: "V1".."V3", "C1".."C3".
+        Value::String(s) => {
+            let mode = s.to_str()?.to_owned();
+            Some(VibratoChorus::from_mode(&mode).ok_or_else(|| {
+                mlua::Error::RuntimeError(format!(
+                    "unknown organ vibrato mode \"{}\" (expected V1-V3 or C1-C3)",
+                    mode
+                ))
+            })?)
+        }
+        // Table form: either { mode = "C3" } with optional overrides, or the
+        // raw knobs { rate=, depth=, mix= } (depth in cents, mix = dry blend).
+        Value::Table(t) => {
+            let base = match t.get::<Option<String>>("mode")? {
+                Some(mode) => VibratoChorus::from_mode(&mode).ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!(
+                        "unknown organ vibrato mode \"{}\" (expected V1-V3 or C1-C3)",
+                        mode
+                    ))
+                })?,
+                None => VibratoChorus {
+                    rate: 6.9,
+                    depth_cents: 7.0,
+                    chorus_mix: 0.0,
+                },
+            };
+            Some(VibratoChorus {
+                rate: t.get::<Option<f32>>("rate")?.unwrap_or(base.rate),
+                depth_cents: t.get::<Option<f32>>("depth")?.unwrap_or(base.depth_cents),
+                chorus_mix: t
+                    .get::<Option<f32>>("mix")?
+                    .unwrap_or(base.chorus_mix)
+                    .clamp(0.0, 1.0),
+            })
+        }
+        _ => {
+            return Err(mlua::Error::RuntimeError(
+                "organ vibrato must be a mode string (V1-V3/C1-C3) or a table".into(),
+            ));
+        }
+    };
+
+    let character = OrganCharacter {
+        leakage: config
+            .get::<Option<f32>>("leakage")?
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        drive: config
+            .get::<Option<f32>>("drive")?
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        wobble: config
+            .get::<Option<f32>>("wobble")?
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+    };
+
+    Ok(OrganSpec {
+        drawbars,
+        gain,
+        click,
+        percussion,
+        vibrato,
+        character,
+    })
+}
+
 /// Pull a param out of a Lua params table. A param may be:
 ///   - a number → constant
 ///   - a `midi_connect` handle → constant, with a recorded MIDI binding
@@ -452,6 +683,161 @@ fn parse_param_value(v: Value, what: &str) -> mlua::Result<ParamSpec> {
             what
         ))),
     }
+}
+
+/// Parse a plugin `params` subtable, shared by the CLAP and LV2 branches of
+/// `instrument()`/`effect()`. Each entry is one of:
+///   - a number → initial value
+///   - a `midi_connect` handle → recorded as a pending plugin binding
+///   - a modulator table `{ name="sine", ... }` → recorded as a pending mod
+///
+/// `kind` is "clap" or "lv2", used only for error messages. Returns the list
+/// of `(name, initial_value)` pairs to seed the plugin's params.
+#[cfg(any(feature = "clap-host", feature = "lv2-host"))]
+fn parse_plugin_params(
+    builder: &mut SongBuilder,
+    socket_id: u32,
+    config: &Table,
+    kind: &str,
+) -> mlua::Result<Vec<(String, f32)>> {
+    let mut params: Vec<(String, f32)> = Vec::new();
+    if let Some(params_t) = config.get::<Option<Table>>("params")? {
+        for pair in params_t.pairs::<String, Value>() {
+            let (name, value) = pair?;
+            match value {
+                Value::Number(n) => params.push((name, n as f32)),
+                Value::Integer(i) => params.push((name, i as f32)),
+                Value::UserData(ud) => {
+                    let live = ud.borrow::<LiveParam>().map_err(|_| {
+                        mlua::Error::RuntimeError(format!(
+                            "{} param '{}' has unknown userdata (expected midi_connect handle)",
+                            kind, name
+                        ))
+                    })?;
+                    builder.pending_plugin_bindings.push(PendingPluginBinding {
+                        cc: live.cc,
+                        channel: live.channel,
+                        range: live.range,
+                        socket_id,
+                        param_name: name.clone(),
+                    });
+                    params.push((name, live.initial));
+                }
+                Value::Table(t) => {
+                    let mod_name: String = t.get("name")?;
+                    let modulator = parse_modulator(&mod_name, &t)?;
+                    builder.pending_plugin_mods.push(PendingPluginMod {
+                        socket_id,
+                        param_name: name.clone(),
+                        modulator,
+                    });
+                    params.push((name, modulator_initial_value(&modulator)));
+                }
+                _ => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "{} param '{}' must be a number, modulator table, or midi_connect handle",
+                        kind, name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(params)
+}
+
+/// If `config` carries a `clap` or `lv2` key, add the corresponding plugin
+/// socket and return `true`. Otherwise return `false` so the caller falls back
+/// to parsing a built-in instrument/effect. `is_instrument` distinguishes the
+/// `instrument()` and `effect()` call sites.
+///
+/// Plugin paths are resolved relative to the song file's directory. The label
+/// is read from the config table's `label` key (handled by the caller).
+#[cfg(any(feature = "clap-host", feature = "lv2-host"))]
+fn try_add_plugin_socket(
+    builder: &mut SongBuilder,
+    socket_id: u32,
+    config: &Table,
+    is_instrument: bool,
+    label: Option<String>,
+) -> mlua::Result<bool> {
+    let resolve = |path: &str, builder: &SongBuilder| -> String {
+        let p = std::path::Path::new(path);
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            builder.base_dir.join(p)
+        };
+        resolved.to_string_lossy().into_owned()
+    };
+
+    #[cfg(feature = "clap-host")]
+    if let Some(path) = config.get::<Option<String>>("clap")? {
+        let plugin_id: String = config.get("id")?;
+        let params = parse_plugin_params(builder, socket_id, config, "clap")?;
+        let resolved = resolve(&path, builder);
+        builder.add_socket(
+            socket_id,
+            SocketContent::Plugin {
+                path: resolved,
+                plugin_id,
+                is_instrument,
+                params,
+            },
+            label,
+        )?;
+        return Ok(true);
+    }
+    #[cfg(not(feature = "clap-host"))]
+    if config.contains_key("clap")? {
+        return Err(mlua::Error::RuntimeError(
+            "this build has no CLAP support (rebuild with --features clap-host)".into(),
+        ));
+    }
+
+    #[cfg(feature = "lv2-host")]
+    if let Some(path) = config.get::<Option<String>>("lv2")? {
+        // `lv2` is the .lv2 bundle dir; `uri` selects the plugin within it.
+        let plugin_uri: String = config.get("uri")?;
+        let params = parse_plugin_params(builder, socket_id, config, "lv2")?;
+        let resolved = resolve(&path, builder);
+        builder.add_socket(
+            socket_id,
+            SocketContent::Lv2 {
+                path: resolved,
+                plugin_uri,
+                is_instrument,
+                params,
+            },
+            label,
+        )?;
+        return Ok(true);
+    }
+    #[cfg(not(feature = "lv2-host"))]
+    if config.contains_key("lv2")? {
+        return Err(mlua::Error::RuntimeError(
+            "this build has no LV2 support (rebuild with --features lv2-host)".into(),
+        ));
+    }
+
+    Ok(false)
+}
+
+/// Stub for builds with no plugin support: detect a plugin key and error with a
+/// hint, otherwise report "not a plugin" so the caller parses a built-in.
+#[cfg(not(any(feature = "clap-host", feature = "lv2-host")))]
+fn try_add_plugin_socket(
+    _builder: &mut SongBuilder,
+    _socket_id: u32,
+    config: &Table,
+    _is_instrument: bool,
+    _label: Option<String>,
+) -> mlua::Result<bool> {
+    if config.contains_key("clap")? || config.contains_key("lv2")? {
+        return Err(mlua::Error::RuntimeError(
+            "this build has no plugin support (rebuild with --features clap-host,lv2-host)".into(),
+        ));
+    }
+    Ok(false)
 }
 
 impl ParamSpec {
@@ -620,6 +1006,29 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
             "instrument",
             lua.create_function(
                 move |_, (_self, id, config, opts): (Value, u32, Table, Option<Table>)| {
+                    // A `clap`/`lv2` key turns this into a plugin instrument.
+                    // Label may live in the trailing opts or in the config table.
+                    let label = match label_from_opts(opts)? {
+                        Some(l) => Some(l),
+                        None => config.get::<Option<String>>("label")?,
+                    };
+                    {
+                        let mut guard = b.lock().unwrap();
+                        let builder = guard.as_mut().unwrap();
+                        if try_add_plugin_socket(builder, id, &config, true, label.clone())? {
+                            return Ok(());
+                        }
+                    }
+
+                    // A `drawbars` key makes this a built-in tonewheel organ.
+                    if config.contains_key("drawbars")? {
+                        let mut guard = b.lock().unwrap();
+                        let builder = guard.as_mut().unwrap();
+                        let spec = parse_organ_config(&config, id, builder)?;
+                        builder.add_socket(id, SocketContent::Organ(spec), label)?;
+                        return Ok(());
+                    }
+
                     let adsr_t: Table = config.get("adsr")?;
                     let adsr = ADSR {
                         a: adsr_t.get(1)?,
@@ -637,7 +1046,6 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                         let gain = parse_param_value(gain_value, "oscillator gain")?;
                         oscillators.push((wave, gain));
                     }
-                    let label = label_from_opts(opts)?;
                     b.lock().unwrap().as_mut().unwrap().add_socket(
                         id,
                         SocketContent::Instrument { adsr, oscillators },
@@ -734,17 +1142,34 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
         song.set(
             "effect",
             lua.create_function(
-                move |_,
-                      (_self, id, kind, params, opts): (
-                    Value,
-                    u32,
-                    String,
-                    Table,
-                    Option<Table>,
-                )| {
-                    let label = label_from_opts(opts)?;
+                move |inner_lua, (_self, id, config, opts): (Value, u32, Table, Option<Table>)| {
+                    // Label may live in the trailing opts or in the config table.
+                    let label = match label_from_opts(opts)? {
+                        Some(l) => Some(l),
+                        None => config.get::<Option<String>>("label")?,
+                    };
+
                     let mut guard = b.lock().unwrap();
                     let builder = guard.as_mut().unwrap();
+
+                    // A `clap`/`lv2` key makes this a plugin effect.
+                    if try_add_plugin_socket(builder, id, &config, false, label.clone())? {
+                        return Ok(());
+                    }
+
+                    // Built-in effect: `kind` names it, `params` holds its values.
+                    // An omitted `params` becomes an empty table so effects whose
+                    // fields all default still work.
+                    let kind: String = config.get("kind").map_err(|_| {
+                        mlua::Error::RuntimeError(
+                            "effect table must have a 'kind' field (or a 'clap'/'lv2' plugin key)"
+                                .into(),
+                        )
+                    })?;
+                    let params: Table = match config.get::<Option<Table>>("params")? {
+                        Some(t) => t,
+                        None => inner_lua.create_table()?,
+                    };
 
                     let spec = match kind.as_str() {
                         "Gain" => {
@@ -888,204 +1313,6 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                     .add_socket(id, SocketContent::Output, label)?;
                 Ok(())
             })?,
-        )?;
-    }
-
-    #[cfg(feature = "clap-host")]
-    {
-        let b = builder.clone();
-        song.set(
-            "plugin",
-            lua.create_function(
-                move |_,
-                      (_self, id, path, opts, label_opts): (
-                    Value,
-                    u32,
-                    String,
-                    Table,
-                    Option<Table>,
-                )| {
-                    let plugin_id: String = opts.get("id")?;
-                    let is_instrument: bool = opts.get::<Option<bool>>("instrument")?.unwrap_or(true);
-                    // Label lives in the trailing opts table (like other sockets),
-                    // but also accept `label` inside the main opts table for
-                    // convenience.
-                    let label = match label_from_opts(label_opts)? {
-                        Some(l) => Some(l),
-                        None => opts.get::<Option<String>>("label")?,
-                    };
-
-                    let mut guard = b.lock().unwrap();
-                    let builder = guard.as_mut().unwrap();
-
-                    // Resolve the .clap path relative to the song file's dir.
-                    let resolved = {
-                        let p = std::path::Path::new(&path);
-                        if p.is_absolute() {
-                            p.to_path_buf()
-                        } else {
-                            builder.base_dir.join(p)
-                        }
-                    };
-
-                    // Parse the params table: each entry is either a number
-                    // (initial value) or a midi_connect() handle (recorded as a
-                    // pending plugin binding, with its initial used as the value).
-                    let mut params: Vec<(String, f32)> = Vec::new();
-                    if let Some(params_t) = opts.get::<Option<Table>>("params")? {
-                        for pair in params_t.pairs::<String, Value>() {
-                            let (name, value) = pair?;
-                            match value {
-                                Value::Number(n) => params.push((name, n as f32)),
-                                Value::Integer(i) => params.push((name, i as f32)),
-                                Value::UserData(ud) => {
-                                    let live = ud.borrow::<LiveParam>().map_err(|_| {
-                                        mlua::Error::RuntimeError(format!(
-                                            "plugin param '{}' has unknown userdata (expected midi_connect handle)",
-                                            name
-                                        ))
-                                    })?;
-                                    builder.pending_plugin_bindings.push(PendingPluginBinding {
-                                        cc: live.cc,
-                                        channel: live.channel,
-                                        range: live.range,
-                                        socket_id: id,
-                                        param_name: name.clone(),
-                                    });
-                                    params.push((name, live.initial));
-                                }
-                                Value::Table(t) => {
-                                    let mod_name: String = t.get("name")?;
-                                    let modulator = parse_modulator(&mod_name, &t)?;
-                                    builder.pending_plugin_mods.push(PendingPluginMod {
-                                        socket_id: id,
-                                        param_name: name.clone(),
-                                        modulator,
-                                    });
-                                    params.push((name, modulator_initial_value(&modulator)));
-                                }
-                                _ => {
-                                    return Err(mlua::Error::RuntimeError(format!(
-                                        "plugin param '{}' must be a number, modulator table, or midi_connect handle",
-                                        name
-                                    )));
-                                }
-                            }
-                        }
-                    }
-
-                    builder.add_socket(
-                        id,
-                        SocketContent::Plugin {
-                            path: resolved.to_string_lossy().into_owned(),
-                            plugin_id,
-                            is_instrument,
-                            params,
-                        },
-                        label,
-                    )?;
-                    Ok(())
-                },
-            )?,
-        )?;
-    }
-
-    #[cfg(feature = "lv2-host")]
-    {
-        let b = builder.clone();
-        song.set(
-            "lv2",
-            lua.create_function(
-                move |_,
-                      (_self, id, path, opts, label_opts): (
-                    Value,
-                    u32,
-                    String,
-                    Table,
-                    Option<Table>,
-                )| {
-                    // For LV2, `path` is the .lv2 bundle directory and `uri` is
-                    // the plugin URI within it.
-                    let plugin_uri: String = opts.get("uri")?;
-                    let is_instrument: bool =
-                        opts.get::<Option<bool>>("instrument")?.unwrap_or(true);
-                    let label = match label_from_opts(label_opts)? {
-                        Some(l) => Some(l),
-                        None => opts.get::<Option<String>>("label")?,
-                    };
-
-                    let mut guard = b.lock().unwrap();
-                    let builder = guard.as_mut().unwrap();
-
-                    let resolved = {
-                        let p = std::path::Path::new(&path);
-                        if p.is_absolute() {
-                            p.to_path_buf()
-                        } else {
-                            builder.base_dir.join(p)
-                        }
-                    };
-
-                    // Params: number (initial value) or midi_connect() handle,
-                    // addressed by the control port's name or symbol.
-                    let mut params: Vec<(String, f32)> = Vec::new();
-                    if let Some(params_t) = opts.get::<Option<Table>>("params")? {
-                        for pair in params_t.pairs::<String, Value>() {
-                            let (name, value) = pair?;
-                            match value {
-                                Value::Number(n) => params.push((name, n as f32)),
-                                Value::Integer(i) => params.push((name, i as f32)),
-                                Value::UserData(ud) => {
-                                    let live = ud.borrow::<LiveParam>().map_err(|_| {
-                                        mlua::Error::RuntimeError(format!(
-                                            "lv2 param '{}' has unknown userdata (expected midi_connect handle)",
-                                            name
-                                        ))
-                                    })?;
-                                    builder.pending_plugin_bindings.push(PendingPluginBinding {
-                                        cc: live.cc,
-                                        channel: live.channel,
-                                        range: live.range,
-                                        socket_id: id,
-                                        param_name: name.clone(),
-                                    });
-                                    params.push((name, live.initial));
-                                }
-                                Value::Table(t) => {
-                                    // A modulator table { name="sine", ... }
-                                    // drives the param with an LFO each block.
-                                    let mod_name: String = t.get("name")?;
-                                    let modulator = parse_modulator(&mod_name, &t)?;
-                                    builder.pending_plugin_mods.push(PendingPluginMod {
-                                        socket_id: id,
-                                        param_name: name.clone(),
-                                        modulator,
-                                    });
-                                    params.push((name, modulator_initial_value(&modulator)));
-                                }
-                                _ => {
-                                    return Err(mlua::Error::RuntimeError(format!(
-                                        "lv2 param '{}' must be a number, modulator table, or midi_connect handle",
-                                        name
-                                    )));
-                                }
-                            }
-                        }
-                    }
-
-                    builder.add_socket(
-                        id,
-                        SocketContent::Lv2 {
-                            path: resolved.to_string_lossy().into_owned(),
-                            plugin_uri,
-                            is_instrument,
-                            params,
-                        },
-                        label,
-                    )?;
-                    Ok(())
-                },
-            )?,
         )?;
     }
 
@@ -1368,6 +1595,18 @@ impl Song {
                         .collect();
                     let synth = Synth::new(socket.id as usize, adsr, oscillators);
                     AudioNode::Source(Box::new(synth))
+                }
+                SocketContent::Organ(spec) => {
+                    let organ = Organ::new(
+                        socket.id as usize,
+                        spec.drawbars.map(|d| d.build(sample_rate)),
+                        spec.gain.build(sample_rate),
+                        spec.click,
+                        spec.percussion,
+                        spec.vibrato,
+                        spec.character,
+                    );
+                    AudioNode::Source(Box::new(organ))
                 }
                 SocketContent::Sampler { zones } => {
                     // Load every WAV up front (setup time, never the audio

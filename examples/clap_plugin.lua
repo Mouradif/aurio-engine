@@ -1,15 +1,18 @@
 -- CLAP plugin hosting (requires building with `--features clap-host`).
 --
--- `song:plugin(id, "/path/to/Foo.clap", opts)` loads a CLAP bundle and uses it
--- as a graph node. opts:
---   id          = "com.vendor.plugin"  -- the plugin id *inside* the bundle
---   instrument  = true | false         -- true: a note source; false: an audio
---                                          effect (default true)
---   label       = "name"               -- optional, like other sockets
---   params      = { ["Param Name"] = value | midi_connect(...) }
+-- A CLAP plugin is just an `instrument()` or `effect()` whose config table
+-- carries a `clap` key (the path to the .clap bundle):
+--   song:instrument(id, { clap = "/path/Foo.clap", id = "...", params = {...} })
+--   song:effect(id,     { clap = "/path/Foo.clap", id = "...", params = {...} })
+-- Calling it through `instrument()` makes it a note source; through `effect()`
+-- an audio processor. Config keys:
+--   clap   = "/path/to/Foo.clap"   -- the bundle path (relative to this file)
+--   id     = "com.vendor.plugin"   -- the plugin id *inside* the bundle
+--   label  = "name"                -- optional, like other sockets
+--   params = { ["Param Name"] = value | midi_connect(...) | { name="sine", ... } }
 --       Initial parameter values, addressed by the plugin's own parameter
---       names (case-insensitive). A value may be a number, or a midi_connect()
---       handle to drive that param live from a MIDI CC.
+--       names (case-insensitive). A value may be a number, a midi_connect()
+--       handle to drive it live from a MIDI CC, or a modulator table.
 --
 -- If a plugin fails to load (missing file, wrong arch, unknown id), Aurio warns
 -- and keeps playing: an instrument plugin becomes silence, an effect plugin a
@@ -28,16 +31,18 @@ song:bpm(120)
 -- `params = { ["Exact Name"] = midi_connect{ cc = 74, range = { lo, hi } } }`
 -- entry below. (Param values are the plugin's plain values, so pick the range
 -- to match what the dump shows.)
-song:plugin(0, "/Library/Audio/Plug-Ins/CLAP/Surge XT.clap", {
+song:instrument(0, {
+  clap = "/Library/Audio/Plug-Ins/CLAP/Surge XT.clap",
   id = "org.surge-synth-team.surge-xt",
-  instrument = true,
-}, { label = "Synth" })
+  label = "Synth",
+})
 
 -- A CLAP *effect*: it processes the audio passing through it.
-song:plugin(1, "/Library/Audio/Plug-Ins/CLAP/Surge XT Effects.clap", {
+song:effect(1, {
+  clap = "/Library/Audio/Plug-Ins/CLAP/Surge XT Effects.clap",
   id = "org.surge-synth-team.surge-xt-fx",
-  instrument = false,
-}, { label = "FX" })
+  label = "FX",
+})
 
 song:output(99, { label = "main" })
 

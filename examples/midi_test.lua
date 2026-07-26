@@ -23,27 +23,39 @@ song:instrument(0, {
 }, { label = "Drone" })
 
 -- Distortion: drive is static, mix is live.
-song:effect(10, "Distortion", {
-  drive = 4.0,
-  mix   = midi_connect("cc53"),
-}, { label = "drive" })
+song:effect(10, {
+  kind = "Distortion",
+  label = "drive",
+  params = {
+    drive = 4.0,
+    mix   = midi_connect("cc72"),
+  },
+})
 
 -- Master gain bound to a CC, mapped 0.0 .. 0.6 instead of 0.0 .. 1.0
 -- so the loudest position isn't unity.
-song:effect(11, "Gain", {
-  level = midi_connect({ cc = 52, range = { 0.0, 0.6 }, initial = 0.2 }),
-}, { label = "master" })
+song:effect(11, {
+  kind = "Gain",
+  label = "master",
+  params = {
+    level = midi_connect({ cc = 75, range = { 0.0, 0.6 }, initial = 0.2 }),
+  },
+})
 
 -- Delay time bound to a CC. The raw 0..127 maps into the `range` (in ms).
 -- `glide` (seconds) eases the read head toward each new knob value, so riding
 -- the knob bends the echo pitch like a tape delay. Without glide the time
 -- would just jump (no Doppler). `initial` is the starting time in ms.
-song:effect(12, "Delay", {
-  time = midi_connect({ cc = 51, range = { 5, 800 }, initial = 200 }),
-  feedback = 0.5,
-  mix = 0.5,
-  glide = 0.08,
-}, { label = "delay" })
+song:effect(12, {
+  kind = "Delay",
+  label = "delay",
+  params = {
+    time = midi_connect({ cc = 51, range = { 5, 800 }, initial = 200 }),
+    feedback = 0.5,
+    mix = 0.5,
+    glide = 0.08,
+  },
+})
 
 song:output(99, { label = "main" })
 

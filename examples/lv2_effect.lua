@@ -16,23 +16,25 @@ song:bpm(120)
 
 -- A plain built-in synth — no plugins involved in producing the sound.
 song:instrument(0, {
+  label = "Synth",
   adsr = { 0.005, 0.1, 0.4, 0.2 },
   oscillators = {
     { wave = "Saw",      gain = 0.4 },
     { wave = "Triangle", gain = 0.3 },
   },
-}, { label = "Synth" })
+})
 
--- An LV2 effect: nodelay processes the synth's audio. `instrument = false`
--- makes it a Processor node (audio in -> audio out). Its "delay" control port
--- (in samples) is set here; "report_latency" picks the operating mode.
-song:lv2(1, "/Users/mkejji/dev/cpp/nodelay.lv2/build", {
+-- An LV2 effect: nodelay processes the synth's audio. Calling it through
+-- `effect()` makes it a Processor node (audio in -> audio out). Its "delay"
+-- control port (in samples) is set here.
+song:effect(1, {
+  lv2 = "/Users/mkejji/dev/cpp/nodelay.lv2/build",
   uri = "http://gareus.org/oss/lv2/nodelay",
-  instrument = false,
+  label = "Delay",
   params = {
     ["delay"] = 12000,   -- ~0.25s at 48kHz, audibly delayed
   },
-}, { label = "Delay" })
+})
 
 song:output(99, { label = "main" })
 

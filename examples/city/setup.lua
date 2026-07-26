@@ -19,9 +19,9 @@ return function(song)
         },
     }, { label = "Bass" })
 
-    song:effect(10, "Reverb", { delay = 0.35, feedback = 0.3, mix = 0.45 }, { label = "lead_verb" })
-    song:effect(11, "Gain",   { level = 0.35 }, { label = "lead_gain" })
-    song:effect(12, "Gain",   { level = 0.55 }, { label = "bass_gain" })
+    song:effect(10, { kind = "Reverb", label = "lead_verb", params = { delay = 0.35, feedback = 0.3, mix = 0.45 } })
+    song:effect(11, { kind = "Gain", label = "lead_gain", params = { level = 0.35 } })
+    song:effect(12, { kind = "Gain", label = "bass_gain", params = { level = 0.55 } })
     song:output(20, { label = "main" })
 
     song:connection("Lead",      "lead_verb")

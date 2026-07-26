@@ -1,17 +1,20 @@
 -- LV2 plugin hosting (requires building with `--features lv2-host`).
 --
--- `song:lv2(id, "/path/to/Bundle.lv2", opts)` loads an LV2 plugin from its
--- bundle *directory* and uses it as a graph node. opts:
---   uri         = "https://..."        -- the plugin URI inside the bundle
---                                          (from the bundle's .ttl, NOT a path)
---   instrument  = true | false         -- true: a note source; false: an audio
---                                          effect (default true)
---   label       = "name"               -- optional, like other sockets
---   params      = { ["Name or symbol"] = value | midi_connect(...) }
+-- An LV2 plugin is an `instrument()` or `effect()` whose config table carries
+-- an `lv2` key (the path to the .lv2 bundle *directory*):
+--   song:instrument(id, { lv2 = "/path/Bundle.lv2", uri = "...", params = {...} })
+--   song:effect(id,     { lv2 = "/path/Bundle.lv2", uri = "...", params = {...} })
+-- Through `instrument()` it's a note source; through `effect()` an audio
+-- processor. Config keys:
+--   lv2    = "/path/to/Bundle.lv2"   -- the bundle *directory* (rel to this file)
+--   uri    = "https://..."           -- the plugin URI inside the bundle
+--                                       (from the bundle's .ttl, NOT a path)
+--   label  = "name"                  -- optional, like other sockets
+--   params = { ["Name or symbol"] = value | midi_connect(...) | { name="sine", ... } }
 --       Initial values for the plugin's *control* ports, addressed by either
 --       the port's human name ("Master volume") or its LV2 symbol
---       ("mastervol"), case-insensitive. A value may be a number or a
---       midi_connect() handle for live MIDI-CC automation.
+--       ("mastervol"), case-insensitive. A value may be a number, a
+--       midi_connect() handle for live MIDI-CC automation, or a modulator table.
 --
 -- Unlike CLAP, an LV2 bundle is a directory containing `manifest.ttl` and the
 -- binary; the port layout is read from the Turtle/RDF. Note events are sent to
@@ -30,16 +33,17 @@ song:bpm(120)
 -- the bundle's manifest.ttl. "Master volume" (symbol "mastervol", range 0..10)
 -- is bound to MIDI CC 7 here.
 
-song:lv2(0, "/Users/mkejji/dev/cpp/ADLplug/ADLplug-arm64.lv2", {
+song:instrument(0, {
+  lv2 = "/Users/mkejji/dev/cpp/ADLplug/ADLplug-arm64.lv2",
   uri = "https://github.com/jpcima/ADLplug",
-  instrument = true,
+  label = "FM",
   params = {
     ["mastervol"] = midi_connect{ cc = 7, range = { 0, 10 } },
   },
-}, { label = "FM" })
+})
 
 -- A little gain trim after it, using a native effect.
-song:effect(10, "Gain", { level = 0.6 }, { label = "trim" })
+song:effect(10, { kind = "Gain", label = "trim", params = { level = 0.6 } })
 
 song:output(99, { label = "main" })
 

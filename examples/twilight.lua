@@ -58,24 +58,24 @@ song:instrument(4, {
 -- =========================================================================
 
 -- Violin chain: tremolo doubles as vibrato (~5.5 Hz, mild depth).
-song:effect(10, "Tremolo", { rate = 5.5, depth = 0.25 },                   { label = "violin_vib"  })
-song:effect(11, "Lowpass", { cutoff = 4200 },                              { label = "violin_lp"   })
-song:effect(12, "Reverb",  { delay = 0.45, feedback = 0.40, mix = 0.55 },  { label = "violin_verb" })
-song:effect(13, "Gain",    { level = 0.08 },                               { label = "violin_gain" })
+song:effect(10, { kind = "Tremolo", label = "violin_vib", params = { rate = 5.5, depth = 0.25 } })
+song:effect(11, { kind = "Lowpass", label = "violin_lp", params = { cutoff = 4200 } })
+song:effect(12, { kind = "Reverb", label = "violin_verb", params = { delay = 0.45, feedback = 0.40, mix = 0.55 } })
+song:effect(13, { kind = "Gain", label = "violin_gain", params = { level = 0.08 } })
 
-song:effect(20, "Lowpass", { cutoff = 1800 },                              { label = "kick_lp"     })
-song:effect(21, "Gain",    { level = 0.45 },                               { label = "kick_gain"   })
+song:effect(20, { kind = "Lowpass", label = "kick_lp", params = { cutoff = 1800 } })
+song:effect(21, { kind = "Gain", label = "kick_gain", params = { level = 0.45 } })
 
-song:effect(30, "Bitcrusher", { bits = 5 },                                { label = "snare_crush" })
-song:effect(31, "Highpass",   { cutoff = 220 },                            { label = "snare_hp"    })
-song:effect(32, "Gain",       { level = 0.32 },                            { label = "snare_gain"  })
+song:effect(30, { kind = "Bitcrusher", label = "snare_crush", params = { bits = 5 } })
+song:effect(31, { kind = "Highpass", label = "snare_hp", params = { cutoff = 220 } })
+song:effect(32, { kind = "Gain", label = "snare_gain", params = { level = 0.32 } })
 
-song:effect(40, "Lowpass", { cutoff = 7500 },                              { label = "hat_lp"      })
-song:effect(41, "Gain",    { level = 0.18 },                               { label = "hat_gain"    })
+song:effect(40, { kind = "Lowpass", label = "hat_lp", params = { cutoff = 7500 } })
+song:effect(41, { kind = "Gain", label = "hat_gain", params = { level = 0.18 } })
 
-song:effect(50, "Distortion", { drive = 1.4, mix = 0.30 },                 { label = "bass_dist"   })
-song:effect(51, "Lowpass",    { cutoff = 800 },                            { label = "bass_lp"     })
-song:effect(52, "Gain",       { level = 0.32 },                            { label = "bass_gain"   })
+song:effect(50, { kind = "Distortion", label = "bass_dist", params = { drive = 1.4, mix = 0.30 } })
+song:effect(51, { kind = "Lowpass", label = "bass_lp", params = { cutoff = 800 } })
+song:effect(52, { kind = "Gain", label = "bass_gain", params = { level = 0.32 } })
 
 -- =========================================================================
 -- Output + routing

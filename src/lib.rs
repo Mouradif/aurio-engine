@@ -7,6 +7,7 @@ pub mod instrument;
 #[cfg(feature = "lv2-host")]
 pub mod lv2;
 pub mod midi;
+pub mod organ;
 pub mod oscillator;
 pub mod param;
 pub mod phrase;

@@ -28,14 +28,15 @@ song:bpm(120)
 -- cutoff to matter — volume needs no such setup.)
 --
 -- Run with AURIO_DUMP_PARAMS=1 to list Surge's parameter names + ranges.
-song:plugin(0, "/Library/Audio/Plug-Ins/CLAP/Surge XT.clap", {
+song:instrument(0, {
+  clap = "/Library/Audio/Plug-Ins/CLAP/Surge XT.clap",
   id = "org.surge-synth-team.surge-xt",
-  instrument = true,
+  label = "Surge",
   params = {
     -- A 9 Hz sine swinging the scene volume (one way to get tremolo).
     ["A Volume"] = { name = "sine", freq = 9.0, low = 0.4, high = 0.9 },
   },
-}, { label = "Surge" })
+})
 
 song:output(99, { label = "main" })
 

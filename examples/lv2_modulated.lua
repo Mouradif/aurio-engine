@@ -17,24 +17,26 @@
 song:bpm(120)
 
 song:instrument(0, {
+  label = "Synth",
   adsr = { 0.005, 0.1, 0.6, 0.2 },
   oscillators = {
     { wave = "Saw",      gain = 0.4 },
     { wave = "Square",   gain = 0.2 },
   },
-}, { label = "Synth" })
+})
 
 -- tinygain as an effect. Its "gain" port (dB, -20..+20) is modulated by a 5 Hz
 -- sine swinging between -18 dB (near silent) and +6 dB (a touch boosted) -> a
 -- pronounced tremolo. Swap the modulator for `midi_connect{ cc = 7, ... }` to
 -- ride the gain from a controller instead.
-song:lv2(1, "/Users/mkejji/dev/cpp/tinyamp.lv2/build", {
+song:effect(1, {
+  lv2 = "/Users/mkejji/dev/cpp/tinyamp.lv2/build",
   uri = "http://gareus.org/oss/lv2/tinygain#mono",
-  instrument = false,
+  label = "Trem",
   params = {
     ["gain"] = { name = "sine", freq = 5.0, low = -18.0, high = 6.0 },
   },
-}, { label = "Trem" })
+})
 
 song:output(99, { label = "main" })
 

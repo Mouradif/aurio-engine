@@ -36,34 +36,50 @@ song:instrument(1, {
 }, { label = "VoiceB" })
 
 -- Voice A sweeps left↔right with a sine LFO (full cycle every 2s).
-song:effect(10, "Pan", {
-  amount = { name = "sine", freq = 0.5, low = -1, high = 1 },
-}, { label = "panA" })
+song:effect(10, {
+  kind = "Pan",
+  label = "panA",
+  params = {
+    amount = { name = "sine", freq = 0.5, low = -1, high = 1 },
+  },
+})
 
 -- Voice B uses a square LFO to jump hard left / hard right every beat-ish,
 -- creating a ping-pong against Voice A's smooth sweep.
-song:effect(11, "Pan", {
-  amount = { name = "square", freq = 1.5, low = -0.9, high = 0.9 },
-}, { label = "panB" })
+song:effect(11, {
+  kind = "Pan",
+  label = "panB",
+  params = {
+    amount = { name = "square", freq = 1.5, low = -0.9, high = 0.9 },
+  },
+})
 
-song:effect(20, "Gain", { level = 0.5 }, { label = "gainA" })
-song:effect(21, "Gain", { level = 0.5 }, { label = "gainB" })
+song:effect(20, { kind = "Gain", label = "gainA", params = { level = 0.5 } })
+song:effect(21, { kind = "Gain", label = "gainB", params = { level = 0.5 } })
 
 -- Every effect param accepts a modulator now, including filter cutoff. This
 -- low-pass on Voice A sweeps its cutoff from 300 Hz up to 3500 Hz and back
 -- with a slow triangle LFO — the classic filter-sweep sound.
-song:effect(30, "Lowpass", {
-  cutoff = { name = "triangle", freq = 0.2, low = 300, high = 3500 },
-}, { label = "sweepA" })
+song:effect(30, {
+  kind = "Lowpass",
+  label = "sweepA",
+  params = {
+    cutoff = { name = "triangle", freq = 0.2, low = 300, high = 3500 },
+  },
+})
 
 -- Reverb's delay is modulatable too. A *short* delay (1–6 ms) swept by a slow
 -- sine, with high feedback and a 50/50 mix, is a flanger — the moving read-tap
 -- creates the sweeping "jet plane" comb filtering. (delay is in seconds.)
-song:effect(31, "Reverb", {
-  delay    = { name = "sine", freq = 0.15, low = 0.001, high = 0.006 },
-  feedback = 0.7,
-  mix      = 0.5,
-}, { label = "flangeB" })
+song:effect(31, {
+  kind = "Reverb",
+  label = "flangeB",
+  params = {
+    delay    = { name = "sine", freq = 0.15, low = 0.001, high = 0.006 },
+    feedback = 0.7,
+    mix      = 0.5,
+  },
+})
 
 song:output(99, { label = "main" })
 

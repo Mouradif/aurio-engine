@@ -16,9 +16,9 @@ song:instrument(1, {
 }, { label = "Bass" })
 
 -- Effects
-song:effect(2, "Reverb", { delay = 0.5, feedback = 0.5, mix = 0.8 }, { label = "reverb" })
-song:effect(3, "Gain",   { level = 0.3 }, { label = "piano_gain" })
-song:effect(4, "Gain",   { level = 0.6 }, { label = "bass_gain" })
+song:effect(2, { kind = "Reverb", label = "reverb", params = { delay = 0.5, feedback = 0.5, mix = 0.8 } })
+song:effect(3, { kind = "Gain", label = "piano_gain", params = { level = 0.3 } })
+song:effect(4, { kind = "Gain", label = "bass_gain", params = { level = 0.3 } })
 
 -- Outputs
 song:output(10, { label = "main" })
@@ -34,12 +34,12 @@ song:connection("bass_gain",  "main")
 song:phrase("Piano A", {
   duration = 2.0,
   on_enter = function()
-    piano_a_count = 0
+    piano_a_count = 1
     print("[hook] piano A entering")
   end,
   on_loop = function()
-    piano_a_count = piano_a_count + 1
     print("[hook] piano A loop " .. piano_a_count)
+    piano_a_count = piano_a_count + 1
   end,
   on_exit = function()
     print("[hook] piano A leaving after " .. piano_a_count .. " loops")
@@ -54,12 +54,12 @@ song:phrase("Piano A", {
 
 song:phrase("Piano B", {
   on_enter = function()
-    piano_b_count = 0
+    piano_b_count = 1
     print("[hook] piano B entering")
   end,
   on_loop = function()
-    piano_b_count = piano_b_count + 1
     print("[hook] piano B loop " .. piano_b_count)
+    piano_b_count = piano_b_count + 1
   end,
   rtttl = [[
         8a3 8c4 8e4 8f4
@@ -116,8 +116,8 @@ song:track({
   targets = { 0 },
   initial = "Piano A",
   transitions = {
-    { from = "Piano A", to = "Piano B", condition = function() return piano_a_count == 7 end },
-    { from = "Piano B", to = "Piano A", condition = function() return piano_b_count == 7 end },
+    { from = "Piano A", to = "Piano B", condition = function() return piano_a_count == 8 end },
+    { from = "Piano B", to = "Piano A", condition = function() return piano_b_count == 8 end },
   },
 })
 

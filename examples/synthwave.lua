@@ -67,29 +67,29 @@ song:instrument(5, {
 -- =========================================================================
 
 -- Drum chain
-song:effect(20, "Bitcrusher", { bits = 6 },                               { label = "snare_crush" })
-song:effect(21, "Reverb",     { delay = 0.22, feedback = 0.25, mix = 0.35 }, { label = "snare_verb"  })
-song:effect(22, "Highpass",   { cutoff = 6500 },                          { label = "hat_hp"      })
+song:effect(20, { kind = "Bitcrusher", label = "snare_crush", params = { bits = 6 } })
+song:effect(21, { kind = "Reverb", label = "snare_verb", params = { delay = 0.22, feedback = 0.25, mix = 0.35 } })
+song:effect(22, { kind = "Highpass", label = "hat_hp", params = { cutoff = 6500 } })
 
 -- Bass chain
-song:effect(30, "Distortion", { drive = 2.5, mix = 0.6 },                 { label = "bass_drive"  })
-song:effect(31, "Lowpass",    { cutoff = 1100 },                          { label = "bass_lp"     })
+song:effect(30, { kind = "Distortion", label = "bass_drive", params = { drive = 2.5, mix = 0.6 } })
+song:effect(31, { kind = "Lowpass", label = "bass_lp", params = { cutoff = 1100 } })
 
 -- Pad chain
-song:effect(40, "Tremolo",    { rate = 4.5, depth = 0.55 },               { label = "pad_trem"    })
-song:effect(41, "Reverb",     { delay = 0.5, feedback = 0.4, mix = 0.6 }, { label = "pad_verb"    })
+song:effect(40, { kind = "Tremolo", label = "pad_trem", params = { rate = 4.5, depth = 0.55 } })
+song:effect(41, { kind = "Reverb", label = "pad_verb", params = { delay = 0.5, feedback = 0.4, mix = 0.6 } })
 
 -- Lead chain
-song:effect(50, "Distortion", { drive = 3.0, mix = 0.5 },                 { label = "lead_drive"  })
-song:effect(51, "Reverb",     { delay = 0.32, feedback = 0.3, mix = 0.4 }, { label = "lead_verb"   })
+song:effect(50, { kind = "Distortion", label = "lead_drive", params = { drive = 3.0, mix = 0.5 } })
+song:effect(51, { kind = "Reverb", label = "lead_verb", params = { delay = 0.32, feedback = 0.3, mix = 0.4 } })
 
 -- Trim gains (one per source chain)
-song:effect(60, "Gain", { level = 0.65 }, { label = "kick_gain"  })
-song:effect(61, "Gain", { level = 0.45 }, { label = "snare_gain" })
-song:effect(62, "Gain", { level = 0.25 }, { label = "hat_gain"   })
-song:effect(63, "Gain", { level = 0.5  }, { label = "bass_gain"  })
-song:effect(64, "Gain", { level = 0.18 }, { label = "pad_gain"   })
-song:effect(65, "Gain", { level = 0.32 }, { label = "lead_gain"  })
+song:effect(60, { kind = "Gain", label = "kick_gain", params = { level = 0.65 } })
+song:effect(61, { kind = "Gain", label = "snare_gain", params = { level = 0.45 } })
+song:effect(62, { kind = "Gain", label = "hat_gain", params = { level = 0.25 } })
+song:effect(63, { kind = "Gain", label = "bass_gain", params = { level = 0.5  } })
+song:effect(64, { kind = "Gain", label = "pad_gain", params = { level = 0.18 } })
+song:effect(65, { kind = "Gain", label = "lead_gain", params = { level = 0.32 } })
 
 -- =========================================================================
 -- Output

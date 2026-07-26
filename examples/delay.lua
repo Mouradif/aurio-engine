@@ -23,16 +23,20 @@ song:instrument(0, {
   },
 }, { label = "Pluck" })
 
-song:effect(10, "Gain", { level = 0.5 }, { label = "gain" })
+song:effect(10, { kind = "Gain", label = "gain", params = { level = 0.5 } })
 
 -- A tempo-synced ping-pong delay: left taps a dotted-eighth, right a quarter,
 -- so echoes bounce L↔R in a syncopated pattern. feedback gives several repeats.
-song:effect(11, "Delay", {
-  time      = { "8.", "4" },   -- {left, right} as note durations
-  feedback  = 0.45,
-  mix       = 0.5,
-  ping_pong = true,
-}, { label = "pingpong" })
+song:effect(11, {
+  kind = "Delay",
+  label = "pingpong",
+  params = {
+    time      = { "8.", "4" },   -- {left, right} as note durations
+    feedback  = 0.45,
+    mix       = 0.5,
+    ping_pong = true,
+  },
+})
 
 -- A second, deliberately Doppler-y delay: a slow sine sweeps the time between
 -- 120 ms and 400 ms. As the read head chases the moving target, the echoes
@@ -42,12 +46,16 @@ song:effect(11, "Delay", {
 -- It defaults to 0 (no glide, no Doppler) — but here the *modulator* already
 -- moves the time smoothly, so you get the warble even at glide=0. A small
 -- glide adds extra smoothing and makes stepped/CC time changes bend too.
-song:effect(12, "Delay", {
-  time     = { name = "sine", freq = 0.1, low = 120, high = 400 },
-  feedback = 0.5,
-  mix      = 0.45,
-  glide    = 0.04,
-}, { label = "tape" })
+song:effect(12, {
+  kind = "Delay",
+  label = "tape",
+  params = {
+    time     = { name = "sine", freq = 0.1, low = 120, high = 400 },
+    feedback = 0.5,
+    mix      = 0.45,
+    glide    = 0.04,
+  },
+})
 
 song:output(99, { label = "main" })
 

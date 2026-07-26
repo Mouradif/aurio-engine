@@ -64,15 +64,17 @@ impl AudioGraph {
                     }
                 }
             }
+            // A native param target may be an effect or an instrument (e.g.
+            // organ drawbars); route to whichever sits at `node_idx`.
             EventKind::SetParam {
                 node_idx,
                 param_idx,
                 value,
-            } => {
-                if let Some(AudioNode::Processor(effect)) = self.nodes.get_mut(*node_idx) {
-                    effect.set_param(*param_idx, *value);
-                }
-            }
+            } => match self.nodes.get_mut(*node_idx) {
+                Some(AudioNode::Processor(effect)) => effect.set_param(*param_idx, *value),
+                Some(AudioNode::Source(instrument)) => instrument.set_param(*param_idx, *value),
+                _ => {}
+            },
             // A plugin node may be either a Source or a Processor, so route to
             // whichever it is.
             #[cfg(any(feature = "clap-host", feature = "lv2-host"))]

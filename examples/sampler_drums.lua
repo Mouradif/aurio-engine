@@ -21,7 +21,7 @@ song:sampler(0, {
   },
 }, { label = "Drums" })
 
-song:effect(10, "Gain", { level = 0.8 }, { label = "gain" })
+song:effect(10, { kind = "Gain", label = "gain", params = { level = 0.8 } })
 song:output(99, { label = "main" })
 
 song:connection("Drums", "gain")

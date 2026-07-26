@@ -16,6 +16,11 @@ pub trait Instrument {
         }
     }
 
+    /// Stage a parameter change addressed by a native param index (the same
+    /// scheme effects use, so `midi_connect` bindings can target instruments
+    /// too). Default no-op; instruments with live params override it.
+    fn set_param(&mut self, _idx: u8, _value: f32) {}
+
     /// Stage a parameter change addressed by a plugin param id. Default no-op;
     /// only plugin instrument nodes (CLAP/LV2) override it.
     #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
