@@ -4,6 +4,7 @@ pub mod clap;
 pub mod effect;
 pub mod frame;
 pub mod instrument;
+pub mod live_input;
 #[cfg(feature = "lv2-host")]
 pub mod lv2;
 pub mod midi;

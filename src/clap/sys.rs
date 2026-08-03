@@ -64,8 +64,7 @@ pub struct clap_plugin_entry {
 
 #[repr(C)]
 pub struct clap_plugin_factory {
-    pub get_plugin_count:
-        Option<unsafe extern "C" fn(factory: *const clap_plugin_factory) -> u32>,
+    pub get_plugin_count: Option<unsafe extern "C" fn(factory: *const clap_plugin_factory) -> u32>,
     pub get_plugin_descriptor: Option<
         unsafe extern "C" fn(
             factory: *const clap_plugin_factory,
@@ -123,8 +122,9 @@ pub struct clap_plugin {
             process: *const clap_process,
         ) -> clap_process_status,
     >,
-    pub get_extension:
-        Option<unsafe extern "C" fn(plugin: *const clap_plugin, id: *const c_char) -> *const c_void>,
+    pub get_extension: Option<
+        unsafe extern "C" fn(plugin: *const clap_plugin, id: *const c_char) -> *const c_void,
+    >,
     pub on_main_thread: Option<unsafe extern "C" fn(plugin: *const clap_plugin)>,
 }
 
@@ -140,8 +140,9 @@ pub struct clap_host {
     pub vendor: *const c_char,
     pub url: *const c_char,
     pub version: *const c_char,
-    pub get_extension:
-        Option<unsafe extern "C" fn(host: *const clap_host, extension_id: *const c_char) -> *const c_void>,
+    pub get_extension: Option<
+        unsafe extern "C" fn(host: *const clap_host, extension_id: *const c_char) -> *const c_void,
+    >,
     pub request_restart: Option<unsafe extern "C" fn(host: *const clap_host)>,
     pub request_process: Option<unsafe extern "C" fn(host: *const clap_host)>,
     pub request_callback: Option<unsafe extern "C" fn(host: *const clap_host)>,

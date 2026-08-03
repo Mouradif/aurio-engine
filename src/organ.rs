@@ -439,7 +439,7 @@ impl Instrument for Organ {
 
         // Evaluate the live drawbar registrations into linear gains.
         for (i, p) in self.drawbars.iter_mut().enumerate() {
-            self.gain_scratch[i] = drawbar_gain(p.next(sample_rate));
+            self.gain_scratch[i] = drawbar_gain(p.tick(sample_rate));
         }
         // Percussion steals the 1' drawbar's key contact.
         if self.percussion.is_some() {
@@ -475,7 +475,7 @@ impl Instrument for Organ {
 
         // A full 888888888 registration sums to ~4.9x; pull it back so hot
         // registrations don't clip before the drive/gain stages.
-        let pre = output * 0.25 * perc_dip * self.gain.next(sample_rate);
+        let pre = output * 0.25 * perc_dip * self.gain.tick(sample_rate);
 
         // Preamp drive sits after the swell gain so the pedal pushes it.
         let drive = self.character.drive;

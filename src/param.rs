@@ -68,7 +68,7 @@ impl ModState {
     }
 
     /// Advance one frame and return the current modulated value.
-    pub fn next(&mut self, sample_rate: f32) -> f32 {
+    pub fn tick(&mut self, sample_rate: f32) -> f32 {
         let (freq, low, high) = self.modulator.bounds();
         let unipolar = self.modulator.shape(self.phase);
 
@@ -118,10 +118,10 @@ impl Param {
 
     /// Current value for this frame, advancing internal state.
     #[inline]
-    pub fn next(&mut self, sample_rate: f32) -> f32 {
+    pub fn tick(&mut self, sample_rate: f32) -> f32 {
         match self {
-            Param::Const(s) => s.next(),
-            Param::Mod(m) => m.next(sample_rate),
+            Param::Const(s) => s.tick(),
+            Param::Mod(m) => m.tick(sample_rate),
         }
     }
 

@@ -195,8 +195,7 @@ impl ClapPlugin {
         // creating, so we can give a clear error if it's absent.
         let desc_name = unsafe { find_descriptor(factory, plugin_id)? };
 
-        let id_cstr =
-            CString::new(plugin_id).map_err(|_| HostError::NotFound(plugin_id.into()))?;
+        let id_cstr = CString::new(plugin_id).map_err(|_| HostError::NotFound(plugin_id.into()))?;
         let plugin = unsafe {
             let create = (*factory).create_plugin.ok_or(HostError::CreateFailed)?;
             let p = create(factory, host.as_mut() as *mut clap_host, id_cstr.as_ptr());

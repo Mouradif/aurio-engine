@@ -48,8 +48,7 @@ pub struct LV2_Descriptor {
 }
 
 /// `const LV2_Descriptor* lv2_descriptor(uint32_t index)` — the library entry.
-pub type LV2_Descriptor_Function =
-    unsafe extern "C" fn(index: u32) -> *const LV2_Descriptor;
+pub type LV2_Descriptor_Function = unsafe extern "C" fn(index: u32) -> *const LV2_Descriptor;
 
 // ---------------------------------------------------------------------------
 // URID (urid/urid.h)
@@ -62,13 +61,13 @@ pub type LV2_URID_Map_Handle = *mut c_void;
 #[repr(C)]
 pub struct LV2_URID_Map {
     pub handle: LV2_URID_Map_Handle,
-    pub map: Option<unsafe extern "C" fn(handle: LV2_URID_Map_Handle, uri: *const c_char) -> LV2_URID>,
+    pub map:
+        Option<unsafe extern "C" fn(handle: LV2_URID_Map_Handle, uri: *const c_char) -> LV2_URID>,
 }
 
 // Feature URIs we supply / require (null-terminated for FFI).
 pub const LV2_URID_MAP_URI: &[u8] = b"http://lv2plug.in/ns/ext/urid#map\0";
-pub const LV2_BUF_SIZE_BOUNDED: &[u8] =
-    b"http://lv2plug.in/ns/ext/buf-size#boundedBlockLength\0";
+pub const LV2_BUF_SIZE_BOUNDED: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#boundedBlockLength\0";
 
 // URIs we intern through the map.
 pub const LV2_ATOM_SEQUENCE: &[u8] = b"http://lv2plug.in/ns/ext/atom#Sequence\0";

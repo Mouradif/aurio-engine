@@ -167,7 +167,9 @@ impl Lv2Plugin {
             .map_err(|_| HostError::InstantiateFailed)?;
 
         let handle = unsafe {
-            let instantiate = (*descriptor).instantiate.ok_or(HostError::InstantiateFailed)?;
+            let instantiate = (*descriptor)
+                .instantiate
+                .ok_or(HostError::InstantiateFailed)?;
             instantiate(descriptor, sample_rate, bundle.as_ptr(), features.as_ptr())
         };
         if handle.is_null() {

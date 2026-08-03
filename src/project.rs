@@ -1,15 +1,14 @@
 use crate::audio_graph::{AudioGraph, AudioNode, MAX_BLOCK};
+use crate::effect::{Bitcrusher, Delay, Distortion, Gain, Highpass, Lowpass, Pan, Reverb, Tremolo};
 use crate::frame::Frame;
-use crate::effect::{
-    Bitcrusher, Delay, Distortion, Gain, Highpass, Lowpass, Pan, Reverb, Tremolo,
-};
+use crate::live_input::{LiveInput, LiveInputSpec};
 use crate::midi::{MidiNote, ScheduledEvent};
+use crate::midi::{note_name_to_midi, parse_note_value};
 use crate::organ::{Organ, OrganCharacter, Percussion, VibratoChorus};
 use crate::oscillator::{Oscillator, Wave};
 use crate::param::{Modulator, Param};
 use crate::phrase::{Phrase, PhraseEntry, PhraseHooks};
 use crate::phrase_script::PhraseScript;
-use crate::midi::{note_name_to_midi, parse_note_value};
 use crate::rtttl::parse_rtttl;
 use crate::sampler::{Sample, Sampler, Zone};
 use crate::scripting::{LuaRuntime, notes_from_table};
@@ -19,15 +18,30 @@ use crate::synth::{ADSR, Synth};
 use crate::transition::Transition;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use mlua::{Function, Lua, RegistryKey, Table, UserData, Value};
-use ringbuf::{HeapProd, HeapRb};
 use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::{HeapProd, HeapRb};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Default device buffer size in frames (~2.7 ms at 48 kHz).
+///
+/// This is the single biggest lever on the latency you feel while playing a live
+/// input: it sets the period of *both* the input and output callbacks, and the
+/// ring buffer between them scales with it. cpal's platform default is often
+/// 512, which costs ~32 ms round-trip; 128 brings that to ~8 ms.
+///
+/// Small enough to feel immediate, but not so small that a modest graph risks
+/// dropouts. Override with `song:buffer_size(n)`.
+pub const DEFAULT_BUFFER_SIZE: u32 = 128;
+
 pub struct Song {
     bpm: f32,
+    /// Device buffer size in frames, applied to the output stream and to every
+    /// live input. This is the dominant term in round-trip latency, so it's a
+    /// song-level setting rather than a per-node one.
+    buffer_size: Option<u32>,
     sockets: Vec<SocketEntry>,
     labels: HashMap<String, u32>,
     connections: Vec<(SocketRef, SocketRef)>,
@@ -54,6 +68,12 @@ enum SocketContent {
         zones: Vec<SamplerZoneSpec>,
     },
     Organ(OrganSpec),
+    /// A live audio input (guitar, mic, synth via an interface). Produces the
+    /// device's signal continuously instead of responding to note events.
+    Live {
+        spec: LiveInputSpec,
+        gain: ParamSpec,
+    },
     Effect(EffectSpec),
     /// A CLAP plugin loaded from a `.clap` bundle, used as an instrument
     /// (source) or an effect (processor) depending on `is_instrument`.
@@ -247,6 +267,7 @@ struct ResolvedPluginMod {
 #[derive(Default)]
 struct SongBuilder {
     bpm: Option<f32>,
+    buffer_size: Option<u32>,
     /// Directory of the entry song file; used to resolve relative WAV paths
     /// declared in `song:sampler(...)`.
     base_dir: std::path::PathBuf,
@@ -256,6 +277,9 @@ struct SongBuilder {
     phrases: HashMap<String, PhraseSpec>,
     tracks: Vec<TrackSpec>,
     socket_ids: HashSet<u32>,
+    /// Sockets declared as live inputs. Used to reject a track that tries to
+    /// schedule notes onto one.
+    live_socket_ids: HashSet<u32>,
     pending_bindings: Vec<PendingBinding>,
     #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
     pending_plugin_bindings: Vec<PendingPluginBinding>,
@@ -610,6 +634,85 @@ fn parse_organ_config(
         vibrato,
         character,
     })
+}
+
+/// Parse a live-input declaration table:
+///   { live = true,               -- or live = "Scarlett" as a device shorthand
+///     device = "Scarlett 2i2",   -- substring, case-insensitive; omit = default
+///     channels = { 1 },          -- 1-based; one = mono, two = stereo L/R
+///     gain = 0.8,                -- number, modulator, or midi_connect(...)
+///     buffer = 4096 }            -- ring-buffer capacity in frames
+fn parse_live_config(
+    config: &Table,
+    socket_id: u32,
+    builder: &mut SongBuilder,
+) -> mlua::Result<(LiveInputSpec, ParamSpec)> {
+    // `live = "name"` is shorthand for `live = true, device = "name"`.
+    let device = match config.get::<Value>("live")? {
+        Value::String(s) => Some(s.to_str()?.to_owned()),
+        _ => config.get::<Option<String>>("device")?,
+    };
+
+    let channels = match config.get::<Value>("channels")? {
+        Value::Nil => None,
+        Value::Integer(i) => Some(vec![i as u16]),
+        Value::Number(n) => Some(vec![n as u16]),
+        Value::Table(t) => {
+            let mut list = Vec::new();
+            for v in t.sequence_values::<u16>() {
+                list.push(v?);
+            }
+            if list.is_empty() || list.len() > 2 {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "live input 'channels' must list 1 (mono) or 2 (stereo) channels, got {}",
+                    list.len()
+                )));
+            }
+            Some(list)
+        }
+        _ => {
+            return Err(mlua::Error::RuntimeError(
+                "live input 'channels' must be a channel number or a list of 1-2 numbers".into(),
+            ));
+        }
+    };
+
+    let gain = match config.get::<Value>("gain")? {
+        Value::Nil => ParamSpec::Const(1.0),
+        v => parse_organ_param(
+            v,
+            "live input gain",
+            socket_id,
+            LiveInput::PARAM_GAIN,
+            builder,
+        )?,
+    };
+
+    // `buffer` overrides the jitter ring buffer. Unset is the normal case: it's
+    // derived from the device period. This is *not* the latency knob — that's
+    // the song-level `buffer_size`.
+    let buffer_frames = match config.get::<Option<usize>>("buffer")? {
+        Some(n) if n < 64 => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "live input 'buffer' must be at least 64 frames, got {}",
+                n
+            )));
+        }
+        Some(n) => Some(n),
+        None => None,
+    };
+
+    Ok((
+        LiveInputSpec {
+            device,
+            channels,
+            buffer_frames,
+            // Replaced in `play` with the resolved output period; the default
+            // keeps this struct valid on its own.
+            ..LiveInputSpec::default()
+        },
+        gain,
+    ))
 }
 
 /// Pull a param out of a Lua params table. A param may be:
@@ -1003,6 +1106,22 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
     {
         let b = builder.clone();
         song.set(
+            "buffer_size",
+            lua.create_function(move |_, (_self, frames): (Value, u32)| {
+                if frames == 0 {
+                    return Err(mlua::Error::RuntimeError(
+                        "buffer_size must be at least 1 frame".into(),
+                    ));
+                }
+                b.lock().unwrap().as_mut().unwrap().buffer_size = Some(frames);
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
             "instrument",
             lua.create_function(
                 move |_, (_self, id, config, opts): (Value, u32, Table, Option<Table>)| {
@@ -1018,6 +1137,17 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                         if try_add_plugin_socket(builder, id, &config, true, label.clone())? {
                             return Ok(());
                         }
+                    }
+
+                    // A `live` key makes this a live audio input: no notes, no
+                    // phrases — it just streams whatever the device picks up.
+                    if config.contains_key("live")? {
+                        let mut guard = b.lock().unwrap();
+                        let builder = guard.as_mut().unwrap();
+                        let (spec, gain) = parse_live_config(&config, id, builder)?;
+                        builder.add_socket(id, SocketContent::Live { spec, gain }, label)?;
+                        builder.live_socket_ids.insert(id);
+                        return Ok(());
                     }
 
                     // A `drawbars` key makes this a built-in tonewheel organ.
@@ -1072,8 +1202,9 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                     let parse_zone = |t: &Table| -> mlua::Result<SamplerZoneSpec> {
                         let file: String = t.get("file")?;
                         let root = match t.get::<Value>("root")? {
-                            Value::Nil => note_name_to_midi("c3")
-                                .map_err(mlua::Error::RuntimeError)?,
+                            Value::Nil => {
+                                note_name_to_midi("c3").map_err(mlua::Error::RuntimeError)?
+                            }
                             v => parse_note_value(&v)?,
                         };
                         let low = match t.get::<Value>("low")? {
@@ -1220,13 +1351,8 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                                 Distortion::PARAM_DRIVE,
                                 builder,
                             )?;
-                            let mix = extract_param(
-                                &params,
-                                "mix",
-                                id,
-                                Distortion::PARAM_MIX,
-                                builder,
-                            )?;
+                            let mix =
+                                extract_param(&params, "mix", id, Distortion::PARAM_MIX, builder)?;
                             EffectSpec::Distortion { drive, mix }
                         }
                         "Tremolo" => EffectSpec::Tremolo {
@@ -1415,6 +1541,67 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                     targets.push(parse_socket_ref(&v?)?);
                 }
 
+                // A live track carries no phrases: the sound comes from the
+                // input device, not from a score. `mode = "live"` makes that
+                // explicit in the song file, but it's optional — a live input
+                // plays as soon as it's connected, with or without a track.
+                let mode = opts.get::<Option<String>>("mode")?;
+                let is_live = match mode.as_deref() {
+                    None | Some("phrases") => false,
+                    Some("live") => true,
+                    Some(other) => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "unknown track mode '{}' (expected \"live\" or \"phrases\")",
+                            other
+                        )));
+                    }
+                };
+
+                {
+                    let guard = b.lock().unwrap();
+                    let builder = guard.as_ref().unwrap();
+                    // Catch the two ways a track and its targets can disagree,
+                    // with a message that says how to fix it.
+                    for t in &targets {
+                        // Labels are declared before the tracks that use them,
+                        // so they already resolve here; an unknown one is left
+                        // for the panic in `play` that reports it.
+                        let id = match t {
+                            SocketRef::Id(id) => *id,
+                            SocketRef::Label(name) => match builder.labels.get(name) {
+                                Some(&id) => id,
+                                None => continue,
+                            },
+                        };
+                        let target_is_live = builder.live_socket_ids.contains(&id);
+                        if target_is_live && !is_live {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "socket {id} is a live input, so its track needs mode = \"live\" \
+                                 (a live input has no phrases to sequence)"
+                            )));
+                        }
+                        if !target_is_live && is_live {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "track has mode = \"live\" but socket {id} is not a live input"
+                            )));
+                        }
+                    }
+                }
+
+                if is_live {
+                    for key in ["initial", "transitions"] {
+                        if opts.contains_key(key)? {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "a live track cannot have '{}' — a live input plays continuously",
+                                key
+                            )));
+                        }
+                    }
+                    // Nothing to schedule, so no StateGraph is created. The
+                    // graph already renders every source node every block.
+                    return Ok(());
+                }
+
                 let initial: String = opts.get("initial")?;
 
                 let transitions_t: Option<Table> = opts.get("transitions")?;
@@ -1540,6 +1727,7 @@ impl Song {
 
         Ok(Song {
             bpm: state.bpm.unwrap_or(120.0),
+            buffer_size: state.buffer_size,
             sockets: state.sockets,
             labels: state.labels,
             connections: state.connections,
@@ -1562,11 +1750,23 @@ impl Song {
         let sample_rate = stream_config.sample_rate() as f32;
         let channels = stream_config.channels() as usize;
 
+        // Resolve the device buffer size, clamped to what the output device
+        // actually supports. This sets the callback period — the dominant term
+        // in the latency you feel playing a live input — so report it in ms.
+        let requested = self.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
+        let buffer_size = clamp_buffer_size(stream_config.buffer_size(), requested, "output");
+
         println!("Audio: {} Hz, {} channels", sample_rate, channels);
+        println!(
+            "Buffer: {} frames ({:.1} ms per callback)",
+            buffer_size,
+            buffer_size as f32 * 1000.0 / sample_rate
+        );
         println!("Playing at {} BPM...", self.bpm);
 
         let Song {
             bpm,
+            buffer_size: _,
             sockets,
             labels,
             connections,
@@ -1608,15 +1808,34 @@ impl Song {
                     );
                     AudioNode::Source(Box::new(organ))
                 }
+                SocketContent::Live { mut spec, gain } => {
+                    // Run the input on the same period as the output, so neither
+                    // side is systematically ahead of the other.
+                    spec.device_buffer = buffer_size;
+                    // Opening the device starts capture immediately. A failure
+                    // is skip-and-warn, matching the plugin nodes: the rest of
+                    // the song still plays, this socket is just silent.
+                    match LiveInput::open(
+                        socket.id as usize,
+                        &spec,
+                        gain.build(sample_rate),
+                        sample_rate,
+                    ) {
+                        Ok(node) => AudioNode::Source(Box::new(node)),
+                        Err(e) => {
+                            eprintln!("[live] socket {}: {}", socket.id, e);
+                            AudioNode::Source(Box::new(SilentSource::new(socket.id as usize)))
+                        }
+                    }
+                }
                 SocketContent::Sampler { zones } => {
                     // Load every WAV up front (setup time, never the audio
                     // callback). A failed load is fatal — better to know now.
                     let zones: Vec<Zone> = zones
                         .into_iter()
                         .map(|z| {
-                            let sample = Sample::load(&z.file).unwrap_or_else(|e| {
-                                panic!("sampler socket {}: {}", socket.id, e)
-                            });
+                            let sample = Sample::load(&z.file)
+                                .unwrap_or_else(|e| panic!("sampler socket {}: {}", socket.id, e));
                             Zone {
                                 sample,
                                 root: z.root,
@@ -1641,18 +1860,12 @@ impl Song {
                     mix.build(sample_rate),
                     sample_rate,
                 ))),
-                SocketContent::Effect(EffectSpec::Lowpass { cutoff }) => {
-                    AudioNode::Processor(Box::new(Lowpass::new(
-                        cutoff.build(sample_rate),
-                        sample_rate,
-                    )))
-                }
-                SocketContent::Effect(EffectSpec::Highpass { cutoff }) => {
-                    AudioNode::Processor(Box::new(Highpass::new(
-                        cutoff.build(sample_rate),
-                        sample_rate,
-                    )))
-                }
+                SocketContent::Effect(EffectSpec::Lowpass { cutoff }) => AudioNode::Processor(
+                    Box::new(Lowpass::new(cutoff.build(sample_rate), sample_rate)),
+                ),
+                SocketContent::Effect(EffectSpec::Highpass { cutoff }) => AudioNode::Processor(
+                    Box::new(Highpass::new(cutoff.build(sample_rate), sample_rate)),
+                ),
                 SocketContent::Effect(EffectSpec::Distortion { drive, mix }) => {
                     AudioNode::Processor(Box::new(Distortion::new(
                         drive.build(sample_rate),
@@ -1667,12 +1880,9 @@ impl Song {
                         sample_rate,
                     )))
                 }
-                SocketContent::Effect(EffectSpec::Bitcrusher { bits }) => {
-                    AudioNode::Processor(Box::new(Bitcrusher::new(
-                        bits.build(sample_rate),
-                        sample_rate,
-                    )))
-                }
+                SocketContent::Effect(EffectSpec::Bitcrusher { bits }) => AudioNode::Processor(
+                    Box::new(Bitcrusher::new(bits.build(sample_rate), sample_rate)),
+                ),
                 SocketContent::Effect(EffectSpec::Pan { amount }) => {
                     AudioNode::Processor(Box::new(Pan::new(amount.build(sample_rate), sample_rate)))
                 }
@@ -1807,7 +2017,9 @@ impl Song {
                                 let ps = node.params();
                                 println!(
                                     "[lv2] socket {}: '{}' exposes {} control params:",
-                                    socket.id, plugin_uri, ps.len()
+                                    socket.id,
+                                    plugin_uri,
+                                    ps.len()
                                 );
                                 for p in &ps {
                                     println!(
@@ -2044,7 +2256,8 @@ impl Song {
             );
         }
 
-        let cpal_config: cpal::StreamConfig = stream_config.into();
+        let mut cpal_config: cpal::StreamConfig = stream_config.into();
+        cpal_config.buffer_size = cpal::BufferSize::Fixed(buffer_size);
 
         // Stereo scratch the graph renders into, one slot per device frame.
         // Pre-allocated to MAX_BLOCK so the callback never allocates; longer
@@ -2151,20 +2364,18 @@ impl Song {
     }
 }
 
-/// Fallback nodes used when a CLAP plugin fails to load, so the rest of the
-/// song still plays: an instrument becomes silence, an effect becomes a
+/// Fallback nodes used when a source can't be created — a CLAP/LV2 plugin that
+/// fails to load, or a live input device that can't be opened — so the rest of
+/// the song still plays: an instrument becomes silence, an effect becomes a
 /// transparent pass-through.
-#[cfg(any(feature = "clap-host", feature = "lv2-host"))]
 struct SilentSource {
     id: usize,
 }
-#[cfg(any(feature = "clap-host", feature = "lv2-host"))]
 impl SilentSource {
     fn new(id: usize) -> Self {
         Self { id }
     }
 }
-#[cfg(any(feature = "clap-host", feature = "lv2-host"))]
 impl crate::instrument::Instrument for SilentSource {
     fn id(&self) -> usize {
         self.id
@@ -2181,6 +2392,25 @@ struct Passthrough;
 impl crate::effect::Effect for Passthrough {
     fn process(&mut self, frame: Frame) -> Frame {
         frame
+    }
+}
+
+/// Clamp a requested buffer size to the range the device reports, warning if
+/// the request had to be adjusted. A device that reports `Unknown` gets the
+/// request passed through — cpal will fall back to its default if the driver
+/// rejects it. `what` names the stream in the warning ("input"/"output").
+fn clamp_buffer_size(supported: &cpal::SupportedBufferSize, requested: u32, what: &str) -> u32 {
+    match supported {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            let clamped = requested.clamp(*min, *max);
+            if clamped != requested {
+                eprintln!(
+                    "[audio] {what} buffer size {requested} out of range {min}..={max}, using {clamped}"
+                );
+            }
+            clamped
+        }
+        cpal::SupportedBufferSize::Unknown => requested,
     }
 }
 
@@ -2206,7 +2436,9 @@ where
 /// `MidiInputConnection` (and its callback closure) alive.
 fn spawn_midi_thread(
     bindings: Vec<ResolvedBinding>,
-    #[cfg(any(feature = "clap-host", feature = "lv2-host"))] plugin_bindings: Vec<ResolvedPluginBinding>,
+    #[cfg(any(feature = "clap-host", feature = "lv2-host"))] plugin_bindings: Vec<
+        ResolvedPluginBinding,
+    >,
     mut producer: HeapProd<ScheduledEvent>,
     audio_counter: Arc<AtomicU64>,
 ) {
@@ -2226,9 +2458,7 @@ fn spawn_midi_thread(
         }
 
         let port = ports[0].clone();
-        let port_name = midi_in
-            .port_name(&port)
-            .unwrap_or_else(|_| "?".to_string());
+        let port_name = midi_in.port_name(&port).unwrap_or_else(|_| "?".to_string());
         println!("[midi] listening on: {}", port_name);
 
         let _conn = match midi_in.connect(

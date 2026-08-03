@@ -46,7 +46,8 @@ impl Smoothed {
         self.target = value;
     }
 
-    pub fn next(&mut self) -> f32 {
+    /// Advance one frame toward the target and return the new current value.
+    pub fn tick(&mut self) -> f32 {
         self.current += self.coeff * (self.target - self.current);
         self.current
     }
@@ -67,7 +68,7 @@ impl Gain {
 
 impl Effect for Gain {
     fn process(&mut self, frame: Frame) -> Frame {
-        frame * self.level.next(self.sample_rate)
+        frame * self.level.tick(self.sample_rate)
     }
 
     fn set_param(&mut self, idx: u8, value: f32) {
@@ -99,7 +100,7 @@ impl Pan {
 impl Effect for Pan {
     fn process(&mut self, frame: Frame) -> Frame {
         // Map amount -1..1 to an angle 0..π/2.
-        let amount = self.amount.next(self.sample_rate).clamp(-1.0, 1.0);
+        let amount = self.amount.tick(self.sample_rate).clamp(-1.0, 1.0);
         let angle = (amount + 1.0) * 0.25 * std::f32::consts::PI;
         Frame::new(frame.l * angle.cos(), frame.r * angle.sin())
     }
@@ -165,10 +166,10 @@ impl Effect for Reverb {
         let len = self.buffer.len();
         let delay = self
             .delay
-            .next(self.sample_rate)
+            .tick(self.sample_rate)
             .clamp(0.0, Self::MAX_DELAY_SECONDS);
-        let feedback = self.feedback.next(self.sample_rate).clamp(0.0, 0.99);
-        let mix = self.mix.next(self.sample_rate).clamp(0.0, 1.0);
+        let feedback = self.feedback.tick(self.sample_rate).clamp(0.0, 0.99);
+        let mix = self.mix.tick(self.sample_rate).clamp(0.0, 1.0);
 
         // Delay in samples, kept at least 1 sample below the buffer length so
         // the read tap can't collide with the write head.
@@ -217,7 +218,7 @@ impl Lowpass {
     }
 
     fn alpha(&mut self) -> f32 {
-        let cutoff = self.cutoff.next(self.sample_rate).max(1.0);
+        let cutoff = self.cutoff.tick(self.sample_rate).max(1.0);
         let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
         self.dt / (rc + self.dt)
     }
@@ -261,7 +262,7 @@ impl Highpass {
     }
 
     fn alpha(&mut self) -> f32 {
-        let cutoff = self.cutoff.next(self.sample_rate).max(1.0);
+        let cutoff = self.cutoff.tick(self.sample_rate).max(1.0);
         let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
         rc / (rc + self.dt)
     }
@@ -304,8 +305,8 @@ impl Distortion {
 
 impl Effect for Distortion {
     fn process(&mut self, frame: Frame) -> Frame {
-        let drive = self.drive.next(self.sample_rate);
-        let mix = self.mix.next(self.sample_rate);
+        let drive = self.drive.tick(self.sample_rate);
+        let mix = self.mix.tick(self.sample_rate);
         frame.map(|s| {
             let wet = (s * drive).tanh();
             s * (1.0 - mix) + wet * mix
@@ -344,8 +345,8 @@ impl Tremolo {
 
 impl Effect for Tremolo {
     fn process(&mut self, frame: Frame) -> Frame {
-        let rate = self.rate.next(self.sample_rate).max(0.0);
-        let depth = self.depth.next(self.sample_rate).clamp(0.0, 1.0);
+        let rate = self.rate.tick(self.sample_rate).max(0.0);
+        let depth = self.depth.tick(self.sample_rate).clamp(0.0, 1.0);
         let lfo = (self.phase * 2.0 * std::f32::consts::PI).sin();
         // depth=0 → amp=1 always; depth=1 → amp swings 0..1
         let amp = 1.0 - depth * 0.5 * (1.0 - lfo);
@@ -380,7 +381,7 @@ impl Bitcrusher {
 
 impl Effect for Bitcrusher {
     fn process(&mut self, frame: Frame) -> Frame {
-        let bits = self.bits.next(self.sample_rate).clamp(1.0, 24.0);
+        let bits = self.bits.tick(self.sample_rate).clamp(1.0, 24.0);
         let levels = 2.0_f32.powf(bits - 1.0);
         frame.map(|s| (s * levels).round() / levels)
     }
@@ -488,15 +489,15 @@ impl Effect for Delay {
         let max_samples = (len - 1) as f32;
 
         // Targets in samples, glided toward for the analog character.
-        let target_l = (self.time_l.next(self.sample_rate) * 0.001 * self.sample_rate)
-            .clamp(1.0, max_samples);
-        let target_r = (self.time_r.next(self.sample_rate) * 0.001 * self.sample_rate)
-            .clamp(1.0, max_samples);
+        let target_l =
+            (self.time_l.tick(self.sample_rate) * 0.001 * self.sample_rate).clamp(1.0, max_samples);
+        let target_r =
+            (self.time_r.tick(self.sample_rate) * 0.001 * self.sample_rate).clamp(1.0, max_samples);
         self.current_l += (target_l - self.current_l) * self.glide_coeff;
         self.current_r += (target_r - self.current_r) * self.glide_coeff;
 
-        let feedback = self.feedback.next(self.sample_rate).clamp(0.0, 0.95);
-        let mix = self.mix.next(self.sample_rate).clamp(0.0, 1.0);
+        let feedback = self.feedback.tick(self.sample_rate).clamp(0.0, 0.95);
+        let mix = self.mix.tick(self.sample_rate).clamp(0.0, 1.0);
 
         // Read the delayed signal for each channel.
         let delayed_l = self.read_tap(self.current_l, |f| f.l);

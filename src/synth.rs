@@ -145,12 +145,8 @@ impl Instrument for Synth {
             NoteEvent::NoteOn { pitch, velocity } => {
                 self.voices.retain(|v| v.pitch != *pitch);
                 for (idx, (oscillator, _gain)) in self.oscillators.iter().enumerate() {
-                    self.voices.push(Voice::new(
-                        oscillator.wave.clone(),
-                        idx,
-                        *pitch,
-                        *velocity,
-                    ));
+                    self.voices
+                        .push(Voice::new(oscillator.wave.clone(), idx, *pitch, *velocity));
                 }
             }
             NoteEvent::NoteOff { pitch } => {
@@ -166,7 +162,7 @@ impl Instrument for Synth {
     fn next_sample(&mut self, sample_rate: f32) -> Frame {
         // Evaluate every oscillator's gain once for this frame into scratch.
         for (i, (_, gain)) in self.oscillators.iter_mut().enumerate() {
-            self.gain_scratch[i] = gain.next(sample_rate);
+            self.gain_scratch[i] = gain.tick(sample_rate);
         }
 
         let mut output = 0.0;

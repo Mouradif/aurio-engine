@@ -290,10 +290,7 @@ impl Lv2Node {
             body: LV2_Atom_Sequence_Body { unit: 0, pad: 0 },
         };
         unsafe {
-            std::ptr::write_unaligned(
-                self.event_buf.as_mut_ptr() as *mut LV2_Atom_Sequence,
-                seq,
-            );
+            std::ptr::write_unaligned(self.event_buf.as_mut_ptr() as *mut LV2_Atom_Sequence, seq);
         }
 
         self.staged.clear();
