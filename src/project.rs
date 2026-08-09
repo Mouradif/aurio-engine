@@ -2,8 +2,9 @@ use crate::audio_graph::{AudioGraph, AudioNode, MAX_BLOCK};
 use crate::effect::{Bitcrusher, Delay, Distortion, Gain, Highpass, Lowpass, Pan, Reverb, Tremolo};
 use crate::frame::Frame;
 use crate::live_input::{LiveInput, LiveInputSpec};
-use crate::midi::{MidiNote, ScheduledEvent};
+use crate::midi::{MidiNote, NoteEvent, ScheduledEvent};
 use crate::midi::{note_name_to_midi, parse_note_value};
+use crate::midi_io::{CcAutomation, MidiInNode, MidiInSpec, MidiOutNode, MidiOutSpec};
 use crate::organ::{Organ, OrganCharacter, Percussion, VibratoChorus};
 use crate::oscillator::{Oscillator, Wave};
 use crate::param::{Modulator, Param};
@@ -17,7 +18,7 @@ use crate::static_phrase::StaticPhrase;
 use crate::synth::{ADSR, Synth};
 use crate::transition::Transition;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use mlua::{Function, Lua, RegistryKey, Table, UserData, Value};
+use mlua::{FromLua, Function, Lua, RegistryKey, Table, UserData, Value};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapProd, HeapRb};
 use std::collections::{HashMap, HashSet};
@@ -48,6 +49,8 @@ pub struct Song {
     phrases: HashMap<String, PhraseSpec>,
     tracks: Vec<TrackSpec>,
     pending_bindings: Vec<PendingBinding>,
+    midi_listeners: Vec<MidiListenerSpec>,
+    clock_source: Option<SocketRef>,
     #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
     pending_plugin_bindings: Vec<PendingPluginBinding>,
     #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
@@ -74,6 +77,12 @@ enum SocketContent {
         spec: LiveInputSpec,
         gain: ParamSpec,
     },
+    /// Sends note events to external gear instead of synthesising them. Valid
+    /// as a `song:track()` target, so a phrase can drive a hardware synth.
+    MidiOut(MidiOutSpec),
+    /// Receives notes from a controller and forwards them to the instruments
+    /// it's connected to.
+    MidiIn(MidiInSpec),
     Effect(EffectSpec),
     /// A CLAP plugin loaded from a `.clap` bundle, used as an instrument
     /// (source) or an effect (processor) depending on `is_instrument`.
@@ -202,6 +211,100 @@ pub struct LiveParam {
 
 impl UserData for LiveParam {}
 
+/// Open `midi_out` ports, keyed by label *and* by socket id (as a string), so
+/// `midi_emit` can address a node either way.
+///
+/// Process-wide because `midi_emit` is a plain Lua global registered at load
+/// time, while the ports it sends through aren't open until `play`. One song
+/// plays per process, so a single registry is enough.
+type EmitterRegistry = Arc<Mutex<HashMap<String, crate::midi_io::MidiEmitter>>>;
+
+/// The live tempo, shared by the timing thread and anything that changes it.
+///
+/// Process-wide for the same reason as the emitter registry: `tempo(...)` is a
+/// Lua global registered at load time, but the timing thread it steers doesn't
+/// exist until `play`. One song plays per process.
+fn tempo_handle() -> Arc<crate::midi::Tempo> {
+    use std::sync::OnceLock;
+    static TEMPO: OnceLock<Arc<crate::midi::Tempo>> = OnceLock::new();
+    TEMPO
+        .get_or_init(|| Arc::new(crate::midi::Tempo::new(120.0)))
+        .clone()
+}
+
+fn emitter_registry() -> EmitterRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<EmitterRegistry> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone()
+}
+
+/// Which MIDI messages a `midi_on(...)` listener wants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MidiEventFilter {
+    NoteOn,
+    NoteOff,
+    ControlChange,
+}
+
+impl MidiEventFilter {
+    fn parse(s: &str) -> mlua::Result<Self> {
+        match s.to_lowercase().as_str() {
+            "note_on" => Ok(Self::NoteOn),
+            "note_off" => Ok(Self::NoteOff),
+            "cc" | "control_change" => Ok(Self::ControlChange),
+            other => Err(mlua::Error::RuntimeError(format!(
+                "unknown midi event '{other}' (expected note_on, note_off, or cc)"
+            ))),
+        }
+    }
+}
+
+/// A `midi_on(socket, filter, fn)` registration, as declared in Lua.
+struct MidiListenerSpec {
+    /// The `midi_in` socket to listen on.
+    source: SocketRef,
+    event: MidiEventFilter,
+    /// All optional; `None` matches anything. Channel is 0-indexed here.
+    channel: Option<u8>,
+    /// CC number, for `cc` listeners.
+    cc: Option<u8>,
+    /// Note number, for `note_on`/`note_off` listeners.
+    note: Option<u8>,
+    /// Shared rather than owned: one listener is cloned into the thread that
+    /// serves its port, and the key must outlive this spec.
+    handler: Arc<RegistryKey>,
+}
+
+/// A listener resolved against the ports, ready to hand to a MIDI thread.
+struct ResolvedMidiListener {
+    event: MidiEventFilter,
+    channel: Option<u8>,
+    cc: Option<u8>,
+    note: Option<u8>,
+    handler: Arc<RegistryKey>,
+}
+
+impl ResolvedMidiListener {
+    /// Does this listener want the given message? `data1` is the note or CC
+    /// number depending on the event type.
+    fn matches(&self, event: MidiEventFilter, channel: u8, data1: u8) -> bool {
+        if self.event != event {
+            return false;
+        }
+        if self.channel.is_some_and(|c| c != channel) {
+            return false;
+        }
+        match event {
+            MidiEventFilter::ControlChange => self.cc.is_none_or(|c| c == data1),
+            MidiEventFilter::NoteOn | MidiEventFilter::NoteOff => {
+                self.note.is_none_or(|n| n == data1)
+            }
+        }
+    }
+}
+
 /// A `LiveParam` reference attached to an effect's named param at lua-eval
 /// time. Resolved into a `ResolvedBinding` once the audio graph is built
 /// and node indices are known.
@@ -280,6 +383,13 @@ struct SongBuilder {
     /// Sockets declared as live inputs. Used to reject a track that tries to
     /// schedule notes onto one.
     live_socket_ids: HashSet<u32>,
+    /// Sockets declared as `midi_in`. Like live inputs, they carry no score,
+    /// so a track that tries to sequence one is a mistake.
+    midi_in_socket_ids: HashSet<u32>,
+    /// `midi_on(...)` listeners, in declaration order.
+    midi_listeners: Vec<MidiListenerSpec>,
+    /// The `midi_in` whose MIDI clock drives the tempo, if any.
+    clock_source: Option<SocketRef>,
     pending_bindings: Vec<PendingBinding>,
     #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
     pending_plugin_bindings: Vec<PendingPluginBinding>,
@@ -642,6 +752,92 @@ fn parse_organ_config(
 ///     channels = { 1 },          -- 1-based; one = mono, two = stereo L/R
 ///     gain = 0.8,                -- number, modulator, or midi_connect(...)
 ///     buffer = 4096 }            -- ring-buffer capacity in frames
+/// Parse the shared `port` / `channel` options of `midi_out` and `midi_in`.
+/// Channels are 1-16 in Lua and 0-indexed internally, matching `midi_connect`.
+/// `channel` is optional for input (unset listens on all channels) and
+/// defaults to 1 for output, which has to pick one.
+fn parse_midi_channel(config: &Table, what: &str) -> mlua::Result<Option<u8>> {
+    match config.get::<Option<u8>>("channel")? {
+        None => Ok(None),
+        Some(ch) if (1..=16).contains(&ch) => Ok(Some(ch - 1)),
+        Some(ch) => Err(mlua::Error::RuntimeError(format!(
+            "{what} 'channel' must be 1..=16, got {ch}"
+        ))),
+    }
+}
+
+/// `song:midi_out(id, { port = "Port 1", channel = 1, label = "korg" })`
+///
+/// An optional `controls` table drives Control Change instead of notes, for
+/// gear played by knobs and pads rather than a keyboard:
+///
+/// ```text
+/// controls = {
+///   [12] = { name = "sine", freq = 0.2, low = 20, high = 100 },  -- swept
+///   [94] = 100,                                                  -- constant
+/// }
+/// ```
+fn parse_midi_out_config(config: &Table) -> mlua::Result<MidiOutSpec> {
+    let mut controls = Vec::new();
+    let mut initial = Vec::new();
+
+    if let Some(t) = config.get::<Option<Table>>("controls")? {
+        for pair in t.pairs::<Value, Value>() {
+            let (key, value) = pair?;
+            let cc = match key {
+                Value::Integer(i) if (0..=127).contains(&i) => i as u8,
+                Value::Integer(i) => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "midi_out control key must be a CC number 0..=127, got {i}"
+                    )));
+                }
+                _ => {
+                    return Err(mlua::Error::RuntimeError(
+                        "midi_out 'controls' keys must be CC numbers, e.g. [12] = ...".into(),
+                    ));
+                }
+            };
+            match value {
+                // A bare number parks the CC at one value for the whole song.
+                Value::Integer(i) => {
+                    initial.push((cc, (i as f32).clamp(0.0, 127.0).round() as u8));
+                }
+                Value::Number(n) => {
+                    initial.push((cc, (n as f32).clamp(0.0, 127.0).round() as u8));
+                }
+                Value::Table(mt) => {
+                    let name: String = mt.get("name")?;
+                    controls.push(CcAutomation {
+                        cc,
+                        modulator: parse_modulator(&name.to_lowercase(), &mt)?,
+                    });
+                }
+                _ => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "midi_out control {cc} must be a number or a modulator table"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(MidiOutSpec {
+        port: config.get::<Option<String>>("port")?,
+        channel: parse_midi_channel(config, "midi_out")?.unwrap_or(0),
+        controls,
+        initial,
+    })
+}
+
+/// `song:midi_in(id, { port = "Port 1", channel = 1, transpose = -12 })`
+fn parse_midi_in_config(config: &Table) -> mlua::Result<MidiInSpec> {
+    Ok(MidiInSpec {
+        port: config.get::<Option<String>>("port")?,
+        channel: parse_midi_channel(config, "midi_in")?,
+        transpose: config.get::<Option<i32>>("transpose")?.unwrap_or(0),
+    })
+}
+
 fn parse_live_config(
     config: &Table,
     socket_id: u32,
@@ -1094,11 +1290,65 @@ fn modulator_initial_value(m: &Modulator) -> f32 {
 fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::Result<()> {
     {
         let b = builder.clone();
+        // `song:bpm(n)` sets the tempo, `song:bpm()` reads it — both before the
+        // song starts and while it plays.
+        //
+        // Which of the two stores it depends on the phase, and the builder is
+        // the tell: it exists until `play` takes it. Before that, the tempo is
+        // part of the song being declared; after, the builder is gone and the
+        // shared handle the timing thread reads is the only thing that matters.
         song.set(
             "bpm",
-            lua.create_function(move |_, (_self, bpm): (Value, f32)| {
-                b.lock().unwrap().as_mut().unwrap().bpm = Some(bpm);
-                Ok(())
+            lua.create_function(move |inner_lua, (_self, bpm): (Value, Option<Value>)| {
+                // `song:bpm({ midi_source = ... })` follows an external clock
+                // instead of naming a fixed tempo.
+                if let Some(Value::Table(t)) = &bpm {
+                    let source = t.get::<Value>("midi_source")?;
+                    if source.is_nil() {
+                        return Err(mlua::Error::RuntimeError(
+                            "song:bpm table form needs 'midi_source'".into(),
+                        ));
+                    }
+                    let source = parse_socket_ref(&source)?;
+                    let mut guard = b.lock().unwrap();
+                    let builder = guard.as_mut().ok_or_else(|| {
+                        mlua::Error::RuntimeError(
+                            "song:bpm{ midi_source = ... } must be declared before the song plays"
+                                .into(),
+                        )
+                    })?;
+                    builder.clock_source = Some(source);
+                    return Ok(0.0);
+                }
+
+                let bpm = match bpm {
+                    None => None,
+                    Some(v) => Some(f32::from_lua(v, inner_lua)?),
+                };
+                let mut guard = b.lock().unwrap();
+                match (guard.as_mut(), bpm) {
+                    // Declaring the song.
+                    (Some(builder), Some(bpm)) => {
+                        builder.bpm = Some(bpm);
+                        Ok(bpm)
+                    }
+                    (Some(builder), None) => Ok(builder.bpm.unwrap_or(120.0)),
+                    // Playing: steer the live tempo. A change lands at the next
+                    // phrase boundary; notes already scheduled keep their tempo.
+                    (None, Some(bpm)) => {
+                        let tempo = tempo_handle();
+                        let applied = tempo.set(bpm);
+                        if (applied - bpm).abs() > f32::EPSILON {
+                            eprintln!(
+                                "[tempo] {bpm} BPM out of range {}..={}, using {applied}",
+                                crate::midi::Tempo::MIN_BPM,
+                                crate::midi::Tempo::MAX_BPM
+                            );
+                        }
+                        Ok(applied)
+                    }
+                    (None, None) => Ok(tempo_handle().get()),
+                }
             })?,
         )?;
     }
@@ -1445,6 +1695,39 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
     {
         let b = builder.clone();
         song.set(
+            "midi_out",
+            lua.create_function(move |_, (_self, id, config): (Value, u32, Table)| {
+                let spec = parse_midi_out_config(&config)?;
+                let label = config.get::<Option<String>>("label")?;
+                b.lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .add_socket(id, SocketContent::MidiOut(spec), label)?;
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
+            "midi_in",
+            lua.create_function(move |_, (_self, id, config): (Value, u32, Table)| {
+                let spec = parse_midi_in_config(&config)?;
+                let label = config.get::<Option<String>>("label")?;
+                let mut guard = b.lock().unwrap();
+                let builder = guard.as_mut().unwrap();
+                builder.add_socket(id, SocketContent::MidiIn(spec), label)?;
+                builder.midi_in_socket_ids.insert(id);
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let b = builder.clone();
+        song.set(
             "connection",
             lua.create_function(move |_, (_self, from, to): (Value, Value, Value)| {
                 let from_ref = parse_socket_ref(&from)?;
@@ -1573,6 +1856,14 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                                 None => continue,
                             },
                         };
+                        // A midi_in carries no score either — its notes come
+                        // from the player, not from a phrase.
+                        if builder.midi_in_socket_ids.contains(&id) {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "socket {id} is a midi input, so it cannot be a track target \
+                                 (connect it to an instrument instead)"
+                            )));
+                        }
                         let target_is_live = builder.live_socket_ids.contains(&id);
                         if target_is_live && !is_live {
                             return Err(mlua::Error::RuntimeError(format!(
@@ -1705,6 +1996,135 @@ impl Song {
         })?;
         lua.lua().globals().set("midi_connect", midi_connect)?;
 
+        // `midi_on(source, filter, handler)` registers a live MIDI listener.
+        // Handlers run on the MIDI thread that owns the source's port, so Lua
+        // globals persist across calls (a latch or arpeggiator works), and a
+        // slow handler delays that port's MIDI without ever risking an audio
+        // dropout.
+        {
+            let b = builder.clone();
+            let midi_on = lua.lua().create_function(
+                move |inner_lua, (source, filter, handler): (Value, Table, Function)| {
+                    let source = parse_socket_ref(&source)?;
+                    let event = MidiEventFilter::parse(&filter.get::<String>("event")?)?;
+
+                    let channel = match filter.get::<Option<u8>>("channel")? {
+                        None => None,
+                        Some(ch) if (1..=16).contains(&ch) => Some(ch - 1),
+                        Some(ch) => {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "midi_on 'channel' must be 1..=16, got {ch}"
+                            )));
+                        }
+                    };
+                    let check = |v: Option<u8>, what: &str| -> mlua::Result<Option<u8>> {
+                        match v {
+                            Some(n) if n > 127 => Err(mlua::Error::RuntimeError(format!(
+                                "midi_on '{what}' must be 0..=127, got {n}"
+                            ))),
+                            other => Ok(other),
+                        }
+                    };
+                    let cc = check(filter.get::<Option<u8>>("cc")?, "cc")?;
+                    let note = check(filter.get::<Option<u8>>("note")?, "note")?;
+
+                    // A filter that names the wrong field for its event is a
+                    // silent no-match at runtime, so reject it at load time.
+                    if event == MidiEventFilter::ControlChange && note.is_some() {
+                        return Err(mlua::Error::RuntimeError(
+                            "midi_on: 'note' has no meaning for a cc listener".into(),
+                        ));
+                    }
+                    if event != MidiEventFilter::ControlChange && cc.is_some() {
+                        return Err(mlua::Error::RuntimeError(
+                            "midi_on: 'cc' has no meaning for a note listener".into(),
+                        ));
+                    }
+
+                    let handler = Arc::new(inner_lua.create_registry_value(handler)?);
+                    b.lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .midi_listeners
+                        .push(MidiListenerSpec {
+                            source,
+                            event,
+                            channel,
+                            cc,
+                            note,
+                            handler,
+                        });
+                    Ok(())
+                },
+            )?;
+            lua.lua().globals().set("midi_on", midi_on)?;
+        }
+
+        // `midi_emit(out, message)` queues a message on a `midi_out` node's
+        // port. The registry is filled in `play`, once the ports are open, so
+        // calling this at load time (outside a handler) is an error.
+        {
+            let emitters = emitter_registry();
+            let midi_emit =
+                lua.lua()
+                    .create_function(move |_, (target, msg): (Value, Table)| {
+                        let key = match &target {
+                            Value::String(s) => s.to_str()?.to_string(),
+                            Value::Integer(i) => i.to_string(),
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(
+                                    "midi_emit expects a midi_out label or socket id".into(),
+                                ));
+                            }
+                        };
+                        let guard = emitters.lock().unwrap();
+                        let emitter = guard.get(&key).ok_or_else(|| {
+                            mlua::Error::RuntimeError(format!(
+                                "midi_emit: unknown midi_out '{key}' \
+                                 (declare it with song:midi_out before emitting)"
+                            ))
+                        })?;
+
+                        let channel = match msg.get::<Option<u8>>("channel")? {
+                            None => None,
+                            Some(ch) if (1..=16).contains(&ch) => Some(ch - 1),
+                            Some(ch) => {
+                                return Err(mlua::Error::RuntimeError(format!(
+                                    "midi_emit 'channel' must be 1..=16, got {ch}"
+                                )));
+                            }
+                        };
+
+                        let cc = msg.get::<Option<u8>>("cc")?;
+                        let note = msg.get::<Option<u8>>("note")?;
+                        match (cc, note) {
+                            (Some(cc), None) => {
+                                let value = msg.get::<Option<u8>>("value")?.unwrap_or(0);
+                                emitter.send_cc(cc, value, channel);
+                            }
+                            (None, Some(note)) => {
+                                // `velocity = 0` is the conventional note off,
+                                // and an explicit `on = false` says it outright.
+                                let velocity = msg.get::<Option<u8>>("velocity")?.unwrap_or(100);
+                                let on = msg.get::<Option<bool>>("on")?.unwrap_or(velocity > 0);
+                                if on {
+                                    emitter.send_note_on(note, velocity, channel);
+                                } else {
+                                    emitter.send_note_off(note, channel);
+                                }
+                            }
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(
+                                    "midi_emit message needs exactly one of 'cc' or 'note'".into(),
+                                ));
+                            }
+                        }
+                        Ok(())
+                    })?;
+            lua.lua().globals().set("midi_emit", midi_emit)?;
+        }
+
         let code = std::fs::read_to_string(path.as_ref())?;
         let chunk_name = path.as_ref().display().to_string();
 
@@ -1725,6 +2145,42 @@ impl Song {
             .take()
             .ok_or("song builder was already taken")?;
 
+        // A listener whose source doesn't exist never fires, and nothing at
+        // runtime would ever mention it — so it has to be caught here.
+        for l in &state.midi_listeners {
+            let id = match &l.source {
+                SocketRef::Id(id) => *id,
+                SocketRef::Label(name) => *state.labels.get(name).ok_or_else(|| {
+                    format!("midi_on: unknown source label '{name}' (no socket has that label)")
+                })?,
+            };
+            if !state.midi_in_socket_ids.contains(&id) {
+                return Err(format!(
+                    "midi_on: socket {id} is not a midi input \
+                     (declare it with song:midi_in to listen on it)"
+                )
+                .into());
+            }
+        }
+
+        // Same for a clock source: MIDI clock arrives on an input, so naming
+        // an output here is the easy mistake to make and worth catching now.
+        if let Some(source) = &state.clock_source {
+            let id = match source {
+                SocketRef::Id(id) => *id,
+                SocketRef::Label(name) => *state.labels.get(name).ok_or_else(|| {
+                    format!("song:bpm: unknown midi_source label '{name}' (no socket has that label)")
+                })?,
+            };
+            if !state.midi_in_socket_ids.contains(&id) {
+                return Err(format!(
+                    "song:bpm: midi_source socket {id} is not a midi input — clock is \
+                     received, so it must be a song:midi_in (a midi_out only sends)"
+                )
+                .into());
+            }
+        }
+
         Ok(Song {
             bpm: state.bpm.unwrap_or(120.0),
             buffer_size: state.buffer_size,
@@ -1734,6 +2190,8 @@ impl Song {
             phrases: state.phrases,
             tracks: state.tracks,
             pending_bindings: state.pending_bindings,
+            midi_listeners: state.midi_listeners,
+            clock_source: state.clock_source,
             #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
             pending_plugin_bindings: state.pending_plugin_bindings,
             #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
@@ -1773,6 +2231,8 @@ impl Song {
             phrases,
             tracks,
             pending_bindings,
+            midi_listeners,
+            clock_source,
             #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
             pending_plugin_bindings,
             #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
@@ -1780,7 +2240,14 @@ impl Song {
         } = self;
 
         let mut audio_nodes: Vec<AudioNode> = Vec::new();
+        // The master audio clock. Declared before the nodes are built because
+        // `midi_out` senders need to read it to know when a queued message is
+        // due; the audio callback advances it.
+        let sample_counter = Arc::new(AtomicU64::new(0));
+
         let mut socket_to_node: HashMap<u32, usize> = HashMap::new();
+        // Collected while building nodes, resolved to note targets afterwards.
+        let mut midi_in_specs: Vec<(u32, MidiInSpec)> = Vec::new();
         // socket id → (lowercased param name → CLAP param id), captured while
         // building plugin nodes so name-based MIDI bindings can be resolved.
         #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
@@ -1827,6 +2294,41 @@ impl Song {
                             AudioNode::Source(Box::new(SilentSource::new(socket.id as usize)))
                         }
                     }
+                }
+                SocketContent::MidiOut(spec) => {
+                    // Opening the port starts the sender thread. A failure is
+                    // skip-and-warn like the live input: the rest of the song
+                    // still plays, this node just goes nowhere.
+                    match MidiOutNode::new(socket.id as usize, &spec, sample_counter.clone()) {
+                        Ok(node) => {
+                            // Publish the open port so `midi_emit` can reach it,
+                            // under the socket id and under its label if it has
+                            // one. A node that failed to open registers nothing,
+                            // so emitting to it reports the name rather than
+                            // silently doing nothing.
+                            let emitter = node.emitter();
+                            let registry = emitter_registry();
+                            let mut reg = registry.lock().unwrap();
+                            reg.insert(socket.id.to_string(), emitter.clone());
+                            for (name, id) in labels.iter() {
+                                if *id == socket.id {
+                                    reg.insert(name.clone(), emitter.clone());
+                                }
+                            }
+                            AudioNode::Source(Box::new(node))
+                        }
+                        Err(e) => {
+                            eprintln!("[midi-out] socket {}: {}", socket.id, e);
+                            AudioNode::Source(Box::new(SilentSource::new(socket.id as usize)))
+                        }
+                    }
+                }
+                SocketContent::MidiIn(spec) => {
+                    // The node itself is inert; the port is opened by the MIDI
+                    // manager once every node index is known, so the notes can
+                    // be addressed to whatever this socket connects to.
+                    midi_in_specs.push((socket.id, spec));
+                    AudioNode::Source(Box::new(MidiInNode::new(socket.id as usize)))
                 }
                 SocketContent::Sampler { zones } => {
                     // Load every WAV up front (setup time, never the audio
@@ -2226,17 +2728,29 @@ impl Song {
         let params_rb = HeapRb::<ScheduledEvent>::new(256);
         let (params_producer, mut params_consumer) = params_rb.split();
 
-        let sample_counter = Arc::new(AtomicU64::new(0));
         let audio_counter = sample_counter.clone();
         let timing_counter = sample_counter.clone();
 
+        // Shared rather than moved: the timing thread runs phrase hooks and
+        // conditions, while each MIDI listener thread runs its handlers. mlua's
+        // `send` feature makes `Lua` `Sync`, and it serializes access
+        // internally, so handlers on different ports can't interleave mid-call.
+        let lua = Arc::new(lua);
+        let timing_lua = lua.clone();
+        let tempo = tempo_handle();
+        // `song:bpm()` is the song's declared tempo, so it wins over anything
+        // a load-time `tempo(n)` call left behind. From here on the shared
+        // handle is the only source of truth, and `tempo(n)` steers it live.
+        tempo.set(bpm);
+        let timing_tempo = tempo.clone();
+
         std::thread::spawn(move || {
             run_timing_thread(
-                &lua,
+                &timing_lua,
                 state_graphs,
                 notes_producer,
                 timing_counter,
-                bpm,
+                timing_tempo,
                 sample_rate,
             );
         });
@@ -2246,13 +2760,65 @@ impl Song {
         #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
         let has_plugin_bindings = !resolved_plugin_bindings.is_empty();
 
-        if !resolved_bindings.is_empty() || has_plugin_bindings {
-            spawn_midi_thread(
+        // A midi_in's notes go to whatever it's connected to. Note events are
+        // addressed by *socket id* (the graph matches them against
+        // `instrument.id()`), so the targets are the ids on the far side of
+        // this socket's outgoing connections.
+        let resolved_midi_ins: Vec<ResolvedMidiIn> = midi_in_specs
+            .into_iter()
+            .map(|(socket_id, spec)| {
+                let targets: Vec<usize> = connections
+                    .iter()
+                    .filter(|(from, _)| resolve_socket_id(from) == socket_id)
+                    .map(|(_, to)| resolve_socket_id(to) as usize)
+                    .collect();
+                let listeners: Vec<Arc<ResolvedMidiListener>> = midi_listeners
+                    .iter()
+                    .filter(|l| resolve_socket_id(&l.source) == socket_id)
+                    .map(|l| {
+                        Arc::new(ResolvedMidiListener {
+                            event: l.event,
+                            channel: l.channel,
+                            cc: l.cc,
+                            note: l.note,
+                            handler: l.handler.clone(),
+                        })
+                    })
+                    .collect();
+
+                // A midi_in earns its keep by feeding an instrument or by
+                // having a listener; with neither, nothing it receives can
+                // ever be observed.
+                if targets.is_empty() && listeners.is_empty() {
+                    eprintln!(
+                        "[midi-in] socket {}: no connections and no midi_on listeners, \
+                         its messages go nowhere",
+                        socket_id
+                    );
+                }
+                ResolvedMidiIn {
+                    port: spec.port,
+                    channel: spec.channel,
+                    transpose: spec.transpose,
+                    targets,
+                    listeners,
+                    is_clock_source: clock_source
+                        .as_ref()
+                        .is_some_and(|c| resolve_socket_id(c) == socket_id),
+                }
+            })
+            .collect();
+
+        if !resolved_bindings.is_empty() || has_plugin_bindings || !resolved_midi_ins.is_empty() {
+            spawn_midi_threads(
                 resolved_bindings,
                 #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
                 resolved_plugin_bindings,
+                resolved_midi_ins,
                 params_producer,
                 sample_counter.clone(),
+                lua.clone(),
+                tempo.clone(),
             );
         }
 
@@ -2358,7 +2924,17 @@ impl Song {
             .unwrap();
 
         stream.play().unwrap();
+
+        // Ctrl-C is the normal way to stop a song, and the default SIGINT
+        // handler kills the process outright — which would strand a note-on
+        // sent to external gear, leaving it droning until it's power-cycled.
+        // Catching the signal lets every MIDI sender release what it's holding.
+        install_sigint_handler();
         loop {
+            if SIGINT_RECEIVED.load(Ordering::Relaxed) {
+                crate::midi_io::shutdown_senders();
+                std::process::exit(0);
+            }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
@@ -2368,6 +2944,28 @@ impl Song {
 /// fails to load, or a live input device that can't be opened — so the rest of
 /// the song still plays: an instrument becomes silence, an effect becomes a
 /// transparent pass-through.
+/// Set by the SIGINT handler; polled by the main loop in `play`.
+static SIGINT_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "C" {
+    fn signal(sig: i32, handler: usize) -> usize;
+}
+
+const SIGINT: i32 = 2;
+
+extern "C" fn handle_sigint(_sig: i32) {
+    // The only async-signal-safe thing done here: flip a flag. The actual
+    // note-off traffic happens back on the main thread.
+    SIGINT_RECEIVED.store(true, Ordering::Relaxed);
+}
+
+fn install_sigint_handler() {
+    unsafe {
+        signal(SIGINT, handle_sigint as *const () as usize);
+    }
+}
+
 struct SilentSource {
     id: usize,
 }
@@ -2434,84 +3032,336 @@ where
 /// `SetParam` events into the audio thread's params ringbuf whenever a
 /// matching CC message arrives. The thread parks forever to keep the
 /// `MidiInputConnection` (and its callback closure) alive.
-fn spawn_midi_thread(
+/// Call one `midi_on` handler with the message that matched it.
+///
+/// The handler gets a single table: `note`/`velocity` for note events,
+/// `cc`/`value` for control changes, plus `channel` (1-16, matching how Lua
+/// declares channels everywhere else). An error is reported and swallowed —
+/// a typo in one handler shouldn't take down the MIDI thread and silence
+/// every other listener on the port.
+fn dispatch_midi_handler(
+    lua: &LuaRuntime,
+    listener: &ResolvedMidiListener,
+    event: MidiEventFilter,
+    channel: u8,
+    msg: &[u8],
+) {
+    let result = (|| -> mlua::Result<()> {
+        let handler: Function = lua.lua().registry_value(&listener.handler)?;
+        let t = lua.lua().create_table()?;
+        t.set("channel", channel + 1)?;
+        match event {
+            MidiEventFilter::ControlChange => {
+                t.set("cc", msg[1])?;
+                t.set("value", msg[2])?;
+            }
+            MidiEventFilter::NoteOn => {
+                t.set("note", msg[1])?;
+                t.set("velocity", msg[2])?;
+            }
+            MidiEventFilter::NoteOff => {
+                t.set("note", msg[1])?;
+                t.set("velocity", 0)?;
+            }
+        }
+        handler.call::<()>(t)
+    })();
+    if let Err(e) = result {
+        eprintln!("[midi] handler error: {}", e);
+    }
+}
+
+/// A `midi_in` node resolved against the audio graph: which physical port it
+/// listens to, and which instrument sockets its notes should reach.
+#[derive(Clone)]
+struct ResolvedMidiIn {
+    /// Case-insensitive substring match on the port name, `None` = first port.
+    port: Option<String>,
+    channel: Option<u8>,
+    transpose: i32,
+    /// Socket ids of the instruments this input feeds, matching the `targets`
+    /// field of a note event (`AudioGraph::process_event` compares these
+    /// against `instrument.id()`).
+    targets: Vec<usize>,
+    /// `midi_on` handlers registered against this socket.
+    listeners: Vec<Arc<ResolvedMidiListener>>,
+    /// Whether this input's MIDI clock drives the song tempo.
+    is_clock_source: bool,
+}
+
+/// Open every MIDI input port the song needs and route incoming messages.
+///
+/// One thread and one connection per *distinct* port, rather than one per
+/// binding: a controller sending CC on the same cable as notes gets opened
+/// once, and a multi-port interface (each cable a separate device) gets one
+/// connection per cable it's actually used for.
+///
+/// Two kinds of traffic come out of a port:
+///   * Control Change → `midi_connect` param bindings, unchanged behaviour.
+///   * Note on/off    → the `midi_in` nodes listening on that port.
+///
+/// Everything is stamped with the current audio sample and pushed onto the
+/// param ring buffer, so the audio callback applies it at the next block
+/// boundary alongside every other scheduled event.
+fn spawn_midi_threads(
     bindings: Vec<ResolvedBinding>,
     #[cfg(any(feature = "clap-host", feature = "lv2-host"))] plugin_bindings: Vec<
         ResolvedPluginBinding,
     >,
-    mut producer: HeapProd<ScheduledEvent>,
+    midi_ins: Vec<ResolvedMidiIn>,
+    producer: HeapProd<ScheduledEvent>,
     audio_counter: Arc<AtomicU64>,
+    lua: Arc<LuaRuntime>,
+    tempo: Arc<crate::midi::Tempo>,
 ) {
-    std::thread::spawn(move || {
-        let midi_in = match midir::MidiInput::new("aurio") {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[midi] init failed: {}", e);
+    // `midi_connect` has no port of its own, so CC bindings ride along on the
+    // default (first) port — preserving the behaviour they had when that was
+    // the only port aurio ever opened.
+    let mut port_keys: Vec<Option<String>> = Vec::new();
+    let has_cc_bindings = !bindings.is_empty() || {
+        #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
+        {
+            !plugin_bindings.is_empty()
+        }
+        #[cfg(not(any(feature = "clap-host", feature = "lv2-host")))]
+        {
+            false
+        }
+    };
+    if has_cc_bindings {
+        port_keys.push(None);
+    }
+    for m in &midi_ins {
+        if !port_keys.contains(&m.port) {
+            port_keys.push(m.port.clone());
+        }
+    }
+    if port_keys.is_empty() {
+        return;
+    }
+
+    // The ring buffer has a single producer, so with several ports feeding it
+    // the push side needs a lock. It's only touched by MIDI callbacks (never
+    // the audio thread), so contention is irrelevant and the audio side stays
+    // lock-free.
+    let producer = Arc::new(Mutex::new(producer));
+
+    for (idx, port_key) in port_keys.into_iter().enumerate() {
+        // CC bindings live on the default port only; note routing is per-port.
+        let cc_bindings = if port_key.is_none() {
+            bindings.clone()
+        } else {
+            Vec::new()
+        };
+        #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
+        let cc_plugin_bindings = if port_key.is_none() {
+            plugin_bindings.clone()
+        } else {
+            Vec::new()
+        };
+        let listeners: Vec<ResolvedMidiIn> = midi_ins
+            .iter()
+            .filter(|m| m.port == port_key)
+            .cloned()
+            .collect();
+
+        let producer = producer.clone();
+        let audio_counter = audio_counter.clone();
+        let lua = lua.clone();
+        let tempo = tempo.clone();
+        // Clock is per-port: only the thread serving the designated source
+        // tracks it, so clock traffic on other ports costs nothing.
+        let tracks_clock = midi_ins
+            .iter()
+            .any(|m| m.port == port_key && m.is_clock_source);
+        let clock = Arc::new(Mutex::new(crate::midi_io::ClockTracker::new()));
+
+        std::thread::spawn(move || {
+            let midi_in = match midir::MidiInput::new("aurio") {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[midi] init failed: {}", e);
+                    return;
+                }
+            };
+
+            let ports = midi_in.ports();
+            if ports.is_empty() {
+                eprintln!("[midi] no input ports available");
                 return;
             }
-        };
 
-        let ports = midi_in.ports();
-        if ports.is_empty() {
-            eprintln!("[midi] no input ports available");
-            return;
-        }
-
-        let port = ports[0].clone();
-        let port_name = midi_in.port_name(&port).unwrap_or_else(|_| "?".to_string());
-        println!("[midi] listening on: {}", port_name);
-
-        let _conn = match midi_in.connect(
-            &port,
-            "aurio-input",
-            move |_ts, msg, _| {
-                // Control Change: status byte 0xBn where n is the channel
-                if msg.len() >= 3 && (msg[0] & 0xF0) == 0xB0 {
-                    let channel = msg[0] & 0x0F;
-                    let cc = msg[1];
-                    let raw = msg[2] as f32 / 127.0;
-
-                    for b in &bindings {
-                        if b.cc == cc && b.channel.is_none_or(|c| c == channel) {
-                            let value = b.range.0 + raw * (b.range.1 - b.range.0);
-                            let event = ScheduledEvent::set_param(
-                                audio_counter.load(Ordering::Relaxed),
-                                b.node_idx,
-                                b.param_idx,
-                                value,
+            let port = match &port_key {
+                Some(want) => {
+                    let want_lc = want.to_lowercase();
+                    match ports.iter().find(|p| {
+                        midi_in
+                            .port_name(p)
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&want_lc)
+                    }) {
+                        Some(p) => p.clone(),
+                        None => {
+                            let available: Vec<String> = ports
+                                .iter()
+                                .map(|p| midi_in.port_name(p).unwrap_or_default())
+                                .collect();
+                            eprintln!(
+                                "[midi] no input port matching '{}' (available: {})",
+                                want,
+                                available.join(", ")
                             );
-                            // Drop on overflow — knob noise is fine to lose.
-                            let _ = producer.try_push(event);
-                        }
-                    }
-
-                    #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
-                    for b in &plugin_bindings {
-                        if b.cc == cc && b.channel.is_none_or(|c| c == channel) {
-                            let value = b.range.0 + raw * (b.range.1 - b.range.0);
-                            let event = ScheduledEvent::set_plugin_param(
-                                audio_counter.load(Ordering::Relaxed),
-                                b.node_idx,
-                                b.param_id,
-                                value,
-                            );
-                            let _ = producer.try_push(event);
+                            return;
                         }
                     }
                 }
-            },
-            (),
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[midi] connect failed: {}", e);
-                return;
-            }
-        };
+                None => ports[0].clone(),
+            };
 
-        // Park forever to keep the connection (and its callback) alive.
-        std::thread::park();
-    });
+            let port_name = midi_in.port_name(&port).unwrap_or_else(|_| "?".to_string());
+            println!("[midi] listening on: {}", port_name);
+
+            // midir wants a unique client name per connection.
+            let conn_name = format!("aurio-input-{}", idx);
+            let _conn = match midi_in.connect(
+                &port,
+                &conn_name,
+                move |_ts, msg, _| {
+                    if msg.is_empty() {
+                        return;
+                    }
+
+                    // System realtime messages are a single byte and carry no
+                    // channel, so they're handled before the channel-voice
+                    // decoding below.
+                    match msg[0] {
+                        0xF8 => {
+                            // Clock pulse. Only the designated source steers
+                            // the tempo; clock on any other port is ignored.
+                            if tracks_clock
+                                && let Some(bpm) = clock.lock().unwrap().pulse()
+                            {
+                                // Just an atomic store. The timing thread
+                                // reads it when it next schedules a phrase, so
+                                // this is safe to call at clock rates from a
+                                // moving knob.
+                                tempo.set(bpm);
+                            }
+                            return;
+                        }
+                        // Stop/start: forget the window, so the gap while
+                        // stopped isn't measured as one enormous beat.
+                        0xFA | 0xFC => {
+                            clock.lock().unwrap().reset();
+                            return;
+                        }
+                        _ => {}
+                    }
+
+                    if msg.len() < 3 {
+                        return;
+                    }
+                    let status = msg[0] & 0xF0;
+                    let channel = msg[0] & 0x0F;
+                    let now = audio_counter.load(Ordering::Relaxed);
+
+                    // Run any `midi_on` handlers this message matches, before
+                    // the built-in routing below. Handlers see the raw message,
+                    // untransposed and unfiltered by the socket's channel.
+                    let observed = match status {
+                        0xB0 => Some(MidiEventFilter::ControlChange),
+                        0x90 if msg[2] > 0 => Some(MidiEventFilter::NoteOn),
+                        0x80 | 0x90 => Some(MidiEventFilter::NoteOff),
+                        _ => None,
+                    };
+                    if let Some(observed) = observed {
+                        for m in &listeners {
+                            for l in &m.listeners {
+                                if l.matches(observed, channel, msg[1]) {
+                                    dispatch_midi_handler(&lua, l, observed, channel, msg);
+                                }
+                            }
+                        }
+                    }
+
+                    match status {
+                        0xB0 => {
+                            let cc = msg[1];
+                            let raw = msg[2] as f32 / 127.0;
+
+                            for b in &cc_bindings {
+                                if b.cc == cc && b.channel.is_none_or(|c| c == channel) {
+                                    let value = b.range.0 + raw * (b.range.1 - b.range.0);
+                                    let event = ScheduledEvent::set_param(
+                                        now,
+                                        b.node_idx,
+                                        b.param_idx,
+                                        value,
+                                    );
+                                    // Drop on overflow — knob noise is fine to lose.
+                                    let _ = producer.lock().unwrap().try_push(event);
+                                }
+                            }
+
+                            #[cfg(any(feature = "clap-host", feature = "lv2-host"))]
+                            for b in &cc_plugin_bindings {
+                                if b.cc == cc && b.channel.is_none_or(|c| c == channel) {
+                                    let value = b.range.0 + raw * (b.range.1 - b.range.0);
+                                    let event = ScheduledEvent::set_plugin_param(
+                                        now,
+                                        b.node_idx,
+                                        b.param_id,
+                                        value,
+                                    );
+                                    let _ = producer.lock().unwrap().try_push(event);
+                                }
+                            }
+                        }
+                        // Note on with velocity 0 is note off, by convention.
+                        0x80 | 0x90 => {
+                            for m in &listeners {
+                                if m.channel.is_some_and(|c| c != channel) {
+                                    continue;
+                                }
+                                let pitch = msg[1] as i32 + m.transpose;
+                                if !(0..=127).contains(&pitch) {
+                                    continue;
+                                }
+                                let pitch = pitch as u8;
+                                let event = if status == 0x90 && msg[2] > 0 {
+                                    NoteEvent::NoteOn {
+                                        pitch,
+                                        velocity: msg[2],
+                                    }
+                                } else {
+                                    NoteEvent::NoteOff { pitch }
+                                };
+                                let scheduled =
+                                    ScheduledEvent::note(m.targets.clone(), now, event);
+                                // Dropping a note-off would hang a voice, so
+                                // report rather than swallow.
+                                if producer.lock().unwrap().try_push(scheduled).is_err() {
+                                    eprintln!("[midi] event queue full, dropped a note");
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                },
+                (),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[midi] connect failed: {}", e);
+                    return;
+                }
+            };
+
+            // Park forever to keep the connection (and its callback) alive.
+            std::thread::park();
+        });
+    }
 }
 
 fn build_phrase_entry(

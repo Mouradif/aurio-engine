@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use crate::{
-    midi::{ScheduledEvent, schedule_phrase},
+    midi::{ScheduledEvent, Tempo, schedule_phrase},
     phrase::PhraseEntry,
     scripting::LuaRuntime,
     transition::Transition,
@@ -80,7 +80,7 @@ pub fn run_timing_thread(
     graphs: Vec<StateGraph>,
     mut producer: HeapProd<ScheduledEvent>,
     sample_counter: Arc<AtomicU64>,
-    bpm: f32,
+    bpm: Arc<Tempo>,
     sample_rate: f32,
 ) {
     let tracks = graphs.len();
@@ -100,7 +100,7 @@ pub fn run_timing_thread(
             &graph.targets,
             &notes,
             entry.phrase.duration_beats(),
-            bpm,
+            bpm.get(),
             sample_rate,
             0,
         );
@@ -142,7 +142,11 @@ pub fn run_timing_thread(
                 &graph.targets,
                 &notes,
                 to_entry.phrase.duration_beats(),
-                bpm,
+                // Read fresh each time: a tempo change takes effect here, on
+                // the next phrase to be scheduled. Nothing already scheduled is
+                // disturbed, so a change is never audible as a cut — it costs
+                // waiting out the current phrase.
+                bpm.get(),
                 sample_rate,
                 phrase_ends[i],
             );

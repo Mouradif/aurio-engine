@@ -8,6 +8,7 @@ pub mod live_input;
 #[cfg(feature = "lv2-host")]
 pub mod lv2;
 pub mod midi;
+pub mod midi_io;
 pub mod organ;
 pub mod oscillator;
 pub mod param;

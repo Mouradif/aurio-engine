@@ -1,3 +1,55 @@
+/// The song's tempo, shared across threads and safe to change while playing.
+///
+/// Stored as bits in an `AtomicU32` rather than behind a lock: the timing
+/// thread reads it at every phrase boundary, and a Lua handler or an incoming
+/// MIDI clock may write it at any moment, so neither side can afford to block
+/// the other.
+///
+/// A change takes effect on the **next phrase to be scheduled**, not on the
+/// one already playing. Notes are planned a whole phrase ahead, and nothing
+/// already scheduled is disturbed — so a tempo change is never audible as a
+/// cut or a retrigger, at the cost of waiting out the current phrase.
+#[derive(Debug)]
+pub struct Tempo {
+    bits: std::sync::atomic::AtomicU32,
+}
+
+impl Tempo {
+    /// Tempo is clamped to a musically sane range. A zero or negative BPM
+    /// would divide by zero in `schedule_phrase`; an absurd one would flood
+    /// the event queue.
+    pub const MIN_BPM: f32 = 20.0;
+    pub const MAX_BPM: f32 = 400.0;
+
+    pub fn new(bpm: f32) -> Self {
+        let t = Self {
+            bits: std::sync::atomic::AtomicU32::new(0),
+        };
+        t.set(bpm);
+        t
+    }
+
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Set the tempo, clamping to the supported range. Returns what was
+    /// actually stored, so callers can report a clamp.
+    ///
+    /// Cheap enough to call at MIDI-clock rates: it's a single atomic store,
+    /// and the timing thread only reads it when it next schedules a phrase.
+    pub fn set(&self, bpm: f32) -> f32 {
+        let clamped = if bpm.is_finite() {
+            bpm.clamp(Self::MIN_BPM, Self::MAX_BPM)
+        } else {
+            120.0
+        };
+        self.bits
+            .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        clamped
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MidiNote {
     pub pitch: u8,
@@ -181,4 +233,44 @@ pub fn schedule_phrase(
     }
     events.sort_by_key(|e| e.sample);
     (phrase_end, events)
+}
+
+#[cfg(test)]
+mod tempo_tests {
+    use super::*;
+
+    #[test]
+    fn tempo_roundtrips_and_clamps() {
+        let t = Tempo::new(120.0);
+        assert_eq!(t.get(), 120.0);
+
+        assert_eq!(t.set(140.0), 140.0);
+        assert_eq!(t.get(), 140.0);
+
+        // Out of range is clamped, not rejected.
+        assert_eq!(t.set(5.0), Tempo::MIN_BPM);
+        assert_eq!(t.set(10_000.0), Tempo::MAX_BPM);
+
+        // A non-finite tempo would poison every later schedule_phrase call.
+        t.set(f32::NAN);
+        assert!(t.get().is_finite());
+        t.set(f32::INFINITY);
+        assert!(t.get().is_finite());
+    }
+
+    #[test]
+    fn tempo_changes_phrase_scheduling() {
+        // The point of a live tempo: the same phrase scheduled at a faster
+        // tempo must end sooner.
+        let notes = vec![MidiNote {
+            pitch: 60,
+            velocity: 100,
+            start_beat: 0.0,
+            duration_beats: 1.0,
+        }];
+        let (end_slow, _) = schedule_phrase(&[0], &notes, 4.0, 60.0, 48_000.0, 0);
+        let (end_fast, _) = schedule_phrase(&[0], &notes, 4.0, 120.0, 48_000.0, 0);
+        assert_eq!(end_slow, 4 * 48_000);
+        assert_eq!(end_fast, 2 * 48_000);
+    }
 }
