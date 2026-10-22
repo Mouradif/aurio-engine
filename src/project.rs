@@ -11,6 +11,7 @@ use crate::param::{Modulator, Param};
 use crate::phrase::{Phrase, PhraseEntry, PhraseHooks};
 use crate::phrase_script::PhraseScript;
 use crate::rtttl::parse_rtttl;
+use crate::exs::ExsInstrument;
 use crate::sampler::{Sample, Sampler, Zone};
 use crate::scripting::{LuaRuntime, notes_from_table};
 use crate::state_graph::{StateGraph, run_timing_thread};
@@ -69,6 +70,9 @@ enum SocketContent {
     },
     Sampler {
         zones: Vec<SamplerZoneSpec>,
+        /// An EXS24 instrument to load zones from, instead of (or alongside)
+        /// the explicitly declared ones.
+        library: Option<String>,
     },
     Organ(OrganSpec),
     /// A live audio input (guitar, mic, synth via an interface). Produces the
@@ -120,8 +124,8 @@ struct OrganSpec {
     character: OrganCharacter,
 }
 
-/// One zone of a sampler, as declared in Lua: a WAV file (already resolved to
-/// an absolute path) mapped to a key range and pitched relative to `root`.
+/// One zone of a sampler, as declared in Lua: an audio file (already resolved
+/// to an absolute path) mapped to a key range and pitched relative to `root`.
 struct SamplerZoneSpec {
     file: String,
     root: u8,
@@ -1481,6 +1485,21 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                         })
                     };
 
+                    // An EXS24 instrument brings its own zones, so `samples`
+                    // and `file` become optional when `library` is given.
+                    let library = match config.get::<Value>("library")? {
+                        Value::Nil => None,
+                        Value::String(s) => {
+                            let p = base_dir.join(s.to_str()?.to_owned());
+                            Some(p.to_string_lossy().into_owned())
+                        }
+                        _ => {
+                            return Err(mlua::Error::RuntimeError(
+                                "sampler 'library' must be a path to an .exs file".into(),
+                            ));
+                        }
+                    };
+
                     // Two forms: a single `file=...` (basic), or a `samples`
                     // list of zone tables (advanced).
                     let zones = match config.get::<Value>("samples")? {
@@ -1496,6 +1515,10 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                             }
                             zones
                         }
+                        // A library supplies the zones, so an explicit sample
+                        // is optional; without one, fall back to the basic
+                        // single-sample form.
+                        Value::Nil if library.is_some() => Vec::new(),
                         Value::Nil => {
                             // Basic single-sample form: map the whole keyboard.
                             let mut zone = parse_zone(&config)?;
@@ -1511,7 +1534,7 @@ fn register_methods(lua: &Lua, song: &Table, builder: &SharedBuilder) -> mlua::R
                     };
 
                     let label = label_from_opts(opts)?;
-                    builder.add_socket(id, SocketContent::Sampler { zones }, label)?;
+                    builder.add_socket(id, SocketContent::Sampler { zones, library }, label)?;
                     Ok(())
                 },
             )?,
@@ -2330,23 +2353,27 @@ impl Song {
                     midi_in_specs.push((socket.id, spec));
                     AudioNode::Source(Box::new(MidiInNode::new(socket.id as usize)))
                 }
-                SocketContent::Sampler { zones } => {
-                    // Load every WAV up front (setup time, never the audio
+                SocketContent::Sampler { zones, library } => {
+                    // Load everything up front (setup time, never the audio
                     // callback). A failed load is fatal — better to know now.
-                    let zones: Vec<Zone> = zones
+                    let mut built: Vec<Zone> = zones
                         .into_iter()
                         .map(|z| {
                             let sample = Sample::load(&z.file)
                                 .unwrap_or_else(|e| panic!("sampler socket {}: {}", socket.id, e));
                             Zone {
-                                sample,
-                                root: z.root,
                                 low: z.low,
                                 high: z.high,
+                                ..Zone::full_range(std::sync::Arc::new(sample), z.root)
                             }
                         })
                         .collect();
-                    let sampler = Sampler::new(socket.id as usize, zones);
+
+                    if let Some(lib) = library {
+                        built.extend(load_exs_zones(&lib, socket.id));
+                    }
+
+                    let sampler = Sampler::new(socket.id as usize, built);
                     AudioNode::Source(Box::new(sampler))
                 }
                 SocketContent::Effect(EffectSpec::Gain { level }) => {
@@ -3417,4 +3444,92 @@ fn clone_optional_key(
         Some(k) => Ok(Some(clone_registry_key(lua, k)?)),
         None => Ok(None),
     }
+}
+
+/// Turn an EXS24 instrument into sampler zones.
+///
+/// Zones are grouped by the sample they reference so each audio file is
+/// opened once. That matters for consolidated libraries: Logic's factory
+/// content puts every recording of an instrument in a single CAF that can run
+/// to tens of megabytes, with each zone owning a frame range of it. Loading
+/// per zone would decode that file hundreds of times.
+///
+/// A sample whose audio can't be found is skipped with a warning rather than
+/// aborting the song, since libraries are routinely copied between machines
+/// without their audio and a partial instrument still plays.
+fn load_exs_zones(path: &str, socket_id: u32) -> Vec<Zone> {
+    let exs_path = std::path::Path::new(path);
+    let inst = ExsInstrument::load(exs_path)
+        .unwrap_or_else(|e| panic!("sampler socket {}: {}", socket_id, e));
+
+    // Which samples are actually referenced, and the frame span each one is
+    // read over. A consolidated file is loaded whole (its zones tile it), but
+    // a per-note file only needs the range its zones touch.
+    let mut used: std::collections::BTreeMap<usize, (u64, u64)> = std::collections::BTreeMap::new();
+    for z in &inst.zones {
+        let end = if z.length == 0 {
+            u64::MAX
+        } else {
+            z.start + z.length
+        };
+        let e = used.entry(z.sample).or_insert((z.start, end));
+        e.0 = e.0.min(z.start);
+        e.1 = if e.1 == u64::MAX || end == u64::MAX {
+            u64::MAX
+        } else {
+            e.1.max(end)
+        };
+    }
+
+    // Decode each referenced file once, remembering the frame offset the
+    // loaded block starts at so zone offsets can be rebased onto it.
+    let mut loaded: std::collections::HashMap<usize, (std::sync::Arc<Sample>, u64)> =
+        std::collections::HashMap::new();
+    for (&idx, &(start, end)) in &used {
+        let s = &inst.samples[idx];
+        let Some(file) = s.resolve(exs_path, &[]) else {
+            eprintln!(
+                "sampler socket {}: sample '{}' not found on disk; its zones are skipped",
+                socket_id, s.file_name
+            );
+            continue;
+        };
+        let range = if end == u64::MAX {
+            None
+        } else {
+            Some((start, end.saturating_sub(start)))
+        };
+        match Sample::load_range(&file, range) {
+            Ok(sample) => {
+                loaded.insert(idx, (std::sync::Arc::new(sample), start));
+            }
+            Err(e) => eprintln!("sampler socket {}: {}", socket_id, e),
+        }
+    }
+
+    inst.zones
+        .iter()
+        .filter_map(|z| {
+            let (sample, base) = loaded.get(&z.sample)?;
+            Some(Zone {
+                sample: sample.clone(),
+                root: z.root,
+                low: z.low,
+                high: z.high,
+                vel_low: z.vel_low,
+                vel_high: z.vel_high,
+                // Rebase onto the block that was actually decoded.
+                start: z.start.saturating_sub(*base) as usize,
+                length: if z.length == 0 {
+                    None
+                } else {
+                    Some(z.length as usize)
+                },
+                fine_tune: z.fine_tune as f32,
+                // EXS stores zone volume in dB; convert to a linear gain.
+                gain: 10f32.powf(z.volume as f32 / 20.0),
+                pitch: z.pitch,
+            })
+        })
+        .collect()
 }

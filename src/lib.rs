@@ -1,7 +1,9 @@
+pub mod audio_file;
 pub mod audio_graph;
 #[cfg(feature = "clap-host")]
 pub mod clap;
 pub mod effect;
+pub mod exs;
 pub mod frame;
 pub mod instrument;
 pub mod live_input;
