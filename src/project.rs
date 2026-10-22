@@ -2903,6 +2903,10 @@ impl Song {
                         // mono device → downmix; otherwise even channels get L,
                         // odd channels get R.
                         for (i, out) in seg.iter().enumerate() {
+                            let out = Frame {
+                                l: speaker_safe(out.l),
+                                r: speaker_safe(out.r),
+                            };
                             let base = (pos + i) * channels;
                             if channels == 1 {
                                 data[base] = (out.l + out.r) * 0.5;
@@ -2997,6 +3001,12 @@ impl crate::effect::Effect for Passthrough {
 /// the request had to be adjusted. A device that reports `Unknown` gets the
 /// request passed through — cpal will fall back to its default if the driver
 /// rejects it. `what` names the stream in the warning ("input"/"output").
+/// Last line of defence before the DAC: never send NaN/inf or anything past
+/// full scale, whatever the graph produced.
+fn speaker_safe(x: f32) -> f32 {
+    if x.is_finite() { x.clamp(-1.0, 1.0) } else { 0.0 }
+}
+
 fn clamp_buffer_size(supported: &cpal::SupportedBufferSize, requested: u32, what: &str) -> u32 {
     match supported {
         cpal::SupportedBufferSize::Range { min, max } => {

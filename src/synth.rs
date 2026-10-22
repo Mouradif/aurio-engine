@@ -17,9 +17,14 @@ pub enum EnvelopePhase {
     Attack(f32),
     Decay(f32),
     Sustain,
-    Release(f32),
+    /// Elapsed time, and the level the release started from.
+    Release(f32, f32),
     Done,
 }
+
+/// Shortest attack/release ramp, in seconds. A zero-length ramp steps the
+/// waveform straight to (or from) full level, which is an audible click.
+const MIN_RAMP: f32 = 0.003;
 
 struct Voice {
     oscillator: Oscillator,
@@ -45,7 +50,7 @@ impl Voice {
     }
 
     pub fn release(&mut self) {
-        self.envelope_phase = EnvelopePhase::Release(0.0);
+        self.envelope_phase = EnvelopePhase::Release(0.0, self.envelope_level);
     }
 
     pub fn is_done(&self) -> bool {
@@ -71,11 +76,12 @@ impl Voice {
         match &mut self.envelope_phase {
             EnvelopePhase::Attack(t) => {
                 *t += dt;
-                if *t >= adsr.a {
+                let a = adsr.a.max(MIN_RAMP);
+                if *t >= a {
                     self.envelope_level = 1.0;
                     self.envelope_phase = EnvelopePhase::Decay(0.0);
                 } else {
-                    self.envelope_level = if adsr.a > 0.0 { *t / adsr.a } else { 1.0 };
+                    self.envelope_level = *t / a;
                 }
             }
             EnvelopePhase::Decay(t) => {
@@ -91,17 +97,15 @@ impl Voice {
             EnvelopePhase::Sustain => {
                 self.envelope_level = adsr.s;
             }
-            EnvelopePhase::Release(t) => {
+            EnvelopePhase::Release(t, start_level) => {
                 *t += dt;
-                if *t >= adsr.r {
+                let r = adsr.r.max(MIN_RAMP);
+                if *t >= r {
                     self.envelope_level = 0.0;
                     self.envelope_phase = EnvelopePhase::Done;
                 } else {
-                    let progress = if adsr.r > 0.0 { *t / adsr.r } else { 1.0 };
-                    self.envelope_level *= 1.0 - progress * dt * sample_rate.recip().max(0.0);
-                    // Simpler: linear release from current level
-                    let start_level = adsr.s; // approximate
-                    self.envelope_level = start_level * (1.0 - progress);
+                    // Linear fade from wherever the note was when released.
+                    self.envelope_level = *start_level * (1.0 - *t / r);
                 }
             }
             EnvelopePhase::Done => {}
@@ -143,7 +147,13 @@ impl Instrument for Synth {
     fn process_event(&mut self, event: &NoteEvent) {
         match event {
             NoteEvent::NoteOn { pitch, velocity } => {
-                self.voices.retain(|v| v.pitch != *pitch);
+                // Fade out a still-sounding voice on the same pitch rather
+                // than cutting it off mid-cycle.
+                for voice in &mut self.voices {
+                    if voice.pitch == *pitch && !matches!(voice.envelope_phase, EnvelopePhase::Release(..)) {
+                        voice.release();
+                    }
+                }
                 for (idx, (oscillator, _gain)) in self.oscillators.iter().enumerate() {
                     self.voices
                         .push(Voice::new(oscillator.wave.clone(), idx, *pitch, *velocity));
@@ -176,5 +186,52 @@ impl Instrument for Synth {
 
     fn id(&self) -> usize {
         self.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: f32 = 48_000.0;
+
+    /// Largest sample-to-sample jump while playing `events` at the given
+    /// frame offsets, for `total` frames.
+    fn max_jump(adsr: ADSR, wave: Wave, events: &[(usize, NoteEvent)], total: usize) -> f32 {
+        let mut synth = Synth::new(0, adsr, vec![]);
+        synth.add_oscillator(wave, Param::constant(1.0, SR));
+        let (mut prev, mut worst) = (0.0f32, 0.0f32);
+        for i in 0..total {
+            for (at, ev) in events {
+                if *at == i {
+                    synth.process_event(ev);
+                }
+            }
+            let s = synth.next_sample(SR).l;
+            worst = worst.max((s - prev).abs());
+            prev = s;
+        }
+        worst
+    }
+
+    // A 55 Hz full-scale sine moves at most ~0.0072 per sample, so anything
+    // well above that is a discontinuity (a click).
+    const CLICK: f32 = 0.02;
+
+    #[test]
+    fn release_mid_decay_fades_from_current_level() {
+        let kick = ADSR { a: 0.0, d: 0.16, s: 0.0, r: 0.04 };
+        let on = NoteEvent::NoteOn { pitch: 33, velocity: 127 };
+        let off = NoteEvent::NoteOff { pitch: 33 };
+        let jump = max_jump(kick, Wave::Sine, &[(0, on), (2_800, off)], 6_000);
+        assert!(jump < CLICK, "jump {jump}");
+    }
+
+    #[test]
+    fn retrigger_same_pitch_does_not_cut() {
+        let bass = ADSR { a: 0.0, d: 0.12, s: 0.45, r: 0.04 };
+        let on = || NoteEvent::NoteOn { pitch: 33, velocity: 127 };
+        let jump = max_jump(bass, Wave::Sine, &[(0, on()), (1_500, on())], 4_000);
+        assert!(jump < CLICK, "jump {jump}");
     }
 }
