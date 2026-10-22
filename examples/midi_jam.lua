@@ -20,11 +20,24 @@ song:midi_in(0, { port = "Port 1", channel = 1, label = "keys" })
 
 -- The voice it plays.
 song:instrument(1, {
-  adsr = { 0.01, 0.15, 0.75, 0.25 },
-  oscillators = {
-    { wave = "Saw",      gain = 0.35 },
-    { wave = "Triangle", gain = 0.25 },
-  },
+	drawbars = {
+		8,
+		8,
+		8,
+		0,
+		0,
+		0,
+		0,
+		0,
+		{ name = "triangle", freq = 0.1, low = 0, high = 6 },
+	},
+	gain = 0.9,
+	click = 0.4,
+	percussion = { harmonic = 3, decay = "fast", volume = "normal" },
+	vibrato = "C3",
+	drive = 0.35,
+	leakage = 0.3,
+	wobble = 0.4,
 }, { label = "lead" })
 
 song:effect(2, { kind = "Reverb", label = "verb", params = { delay = 0.35, feedback = 0.4, mix = 0.5 } })
