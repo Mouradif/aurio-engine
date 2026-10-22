@@ -26,8 +26,7 @@ song:bpm(120)
 -- A CLAP *instrument*: notes routed to it (via a track) drive the plugin, and
 -- its stereo output flows downstream.
 --
--- To bind a param, you need its exact name as the plugin reports it. Run once
--- with `AURIO_DUMP_PARAMS=1` to print every param name + range, then add a
+-- To bind a param, you need its exact name as the plugin reports it.
 -- `params = { ["Exact Name"] = midi_connect{ cc = 74, range = { lo, hi } } }`
 -- entry below. (Param values are the plugin's plain values, so pick the range
 -- to match what the dump shows.)

@@ -104,29 +104,6 @@ impl LiveInput {
     ) -> Result<Self, String> {
         let host = cpal::default_host();
 
-        // `AURIO_LIST_INPUTS=1` prints every input device and its channel
-        // count, so `device = "..."` can be matched against a real name.
-        if std::env::var("AURIO_LIST_INPUTS").is_ok() {
-            println!("[live] available input devices:");
-            if let Ok(devices) = host.input_devices() {
-                for d in devices {
-                    let name = d
-                        .description()
-                        .map(|desc| desc.name().to_string())
-                        .unwrap_or_else(|_| "?".to_string());
-                    match d.default_input_config() {
-                        Ok(c) => println!(
-                            "    \"{}\"  [{} ch @ {} Hz]",
-                            name,
-                            c.channels(),
-                            c.sample_rate()
-                        ),
-                        Err(_) => println!("    \"{}\"  [no default config]", name),
-                    }
-                }
-            }
-        }
-
         let device = match &spec.device {
             Some(pattern) => {
                 let needle = pattern.to_lowercase();

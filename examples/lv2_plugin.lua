@@ -20,9 +20,6 @@
 -- binary; the port layout is read from the Turtle/RDF. Note events are sent to
 -- the plugin's atom-sequence MIDI input port as LV2 Atom events.
 --
--- Run once with AURIO_DUMP_PARAMS=1 to list every control port (name, symbol,
--- range) so you can pick the right param names to bind.
---
 -- As with CLAP, a failed load warns and falls back (instrument -> silence,
 -- effect -> pass-through), so a missing/incompatible plugin never crashes the
 -- song. Update the path/uri below to a bundle you actually have.

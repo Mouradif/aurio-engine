@@ -7,10 +7,6 @@
 --
 -- IMPORTANT — find the real param name first:
 --   CLAP plugins expose their parameters by name, and Surge has *hundreds*.
---   Run once with the dump enabled to list them, then copy the exact cutoff
---   name into `params` below:
---
---     AURIO_DUMP_PARAMS=1 cargo run --features clap-host -- examples/clap_modulated.lua 2>&1 | grep -i cutoff
 --
 --   Surge's cutoff is typically named like "A Filter 1 Cutoff" / "Filter 1
 --   Cutoff" depending on version. If the name below doesn't match, Aurio prints
@@ -26,8 +22,6 @@ song:bpm(120)
 -- unambiguously audible. (Modulating, say, a filter cutoff also works, but in
 -- Surge's default patch the filter routing/type must be set up first for the
 -- cutoff to matter — volume needs no such setup.)
---
--- Run with AURIO_DUMP_PARAMS=1 to list Surge's parameter names + ranges.
 song:instrument(0, {
   clap = "/Library/Audio/Plug-Ins/CLAP/Surge XT.clap",
   id = "org.surge-synth-team.surge-xt",

@@ -2458,23 +2458,6 @@ impl Song {
                             }
                             plugin_param_ids.insert(socket.id, name_to_id);
 
-                            // `AURIO_DUMP_PARAMS=1` lists every param the plugin
-                            // exposes, so bindings can be matched to real names.
-                            if std::env::var("AURIO_DUMP_PARAMS").is_ok() {
-                                println!(
-                                    "[plugin] socket {}: '{}' exposes {} params:",
-                                    socket.id,
-                                    node.name(),
-                                    node.params().len()
-                                );
-                                for p in node.params() {
-                                    println!(
-                                        "    \"{}\"  [{:.3} .. {:.3}, default {:.3}]",
-                                        p.name, p.min, p.max, p.default
-                                    );
-                                }
-                            }
-
                             // Apply declared initial param values by name.
                             for (name, value) in &params {
                                 if let Some(pid) = node.param_id_by_name(name) {
@@ -2541,22 +2524,6 @@ impl Song {
                                 name_to_id.insert(p.symbol.to_lowercase(), p.id);
                             }
                             plugin_param_ids.insert(socket.id, name_to_id);
-
-                            if std::env::var("AURIO_DUMP_PARAMS").is_ok() {
-                                let ps = node.params();
-                                println!(
-                                    "[lv2] socket {}: '{}' exposes {} control params:",
-                                    socket.id,
-                                    plugin_uri,
-                                    ps.len()
-                                );
-                                for p in &ps {
-                                    println!(
-                                        "    \"{}\" (symbol \"{}\")  [{:.3} .. {:.3}, default {:.3}]",
-                                        p.name, p.symbol, p.min, p.max, p.default
-                                    );
-                                }
-                            }
 
                             // Apply declared initial values by name or symbol.
                             for (name, value) in &params {
