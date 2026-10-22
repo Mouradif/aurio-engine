@@ -99,16 +99,21 @@ impl ExsInstrument {
         }
         // The magic at 16 confirms we are looking at an EXS instrument.
         // "JBOS" files set 0x80 in the signature's flag byte, but that only
-        // affects fields we don't read: chunk sizes and the body fields below
-        // are little-endian in both flavours.
+        // affects fields we don't read. "SOBT"/"SOBJ" (the magic byte-swapped)
+        // mark the older big-endian files GarageBand ships: chunk sizes and
+        // every multi-byte body field are big-endian there.
         let magic = &data[16..20];
-        if magic != b"TBOS" && magic != b"JBOS" && magic != b"SOBT" && magic != b"SOBJ" {
-            return Err(format!(
-                "'{}' is not an EXS instrument (bad magic {:?})",
-                path.display(),
-                String::from_utf8_lossy(magic)
-            ));
-        }
+        let be = match magic {
+            b"TBOS" | b"JBOS" => false,
+            b"SOBT" | b"SOBJ" => true,
+            _ => {
+                return Err(format!(
+                    "'{}' is not an EXS instrument (bad magic {:?})",
+                    path.display(),
+                    String::from_utf8_lossy(magic)
+                ));
+            }
+        };
 
         let mut name = String::new();
         let mut zones = Vec::new();
@@ -117,7 +122,7 @@ impl ExsInstrument {
         let mut off = 0usize;
         while off + HEADER <= data.len() {
             // The size field's 0x8000 bit is a flag, not part of the length.
-            let raw = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+            let raw = u32_at(data, off + 4, be);
             let size = if raw & 0x8000 != 0 {
                 (raw & 0x7FFF) as usize
             } else {
@@ -136,11 +141,11 @@ impl ExsInstrument {
                     }
                 }
                 0x01 => {
-                    if let Some(z) = parse_zone(body) {
+                    if let Some(z) = parse_zone(body, be) {
                         zones.push(z);
                     }
                 }
-                0x03 => samples.push(parse_sample(body, chunk_name)),
+                0x03 => samples.push(parse_sample(body, chunk_name, be)),
                 _ => {}
             }
 
@@ -183,54 +188,60 @@ impl ExsInstrument {
     }
 }
 
-/// Zone body layout, all little-endian regardless of the file's flag byte
-/// (the flag governs the chunk header, not these fields):
+/// Zone body layout; multi-byte fields follow the file's byte order:
 ///
 /// ```text
-///   0   flags: 0x08 enables pitch tracking
+///   0   flags: 0x01 one-shot, 0x02 pitch tracking OFF, 0x08 velocity range on
 ///   1   root key            4  fine tune (signed cents)
 ///   5   volume              6  key range low
 ///   7   key range high      9  velocity low
 ///  10   velocity high      12  start frame (u32)
 ///  16   end frame (u32)    20  loop start (u32)
-///  84   group index (i32)  92  sample index (i32)
+///  88   group index (i32)  92  sample index (i32)
 /// ```
-fn parse_zone(b: &[u8]) -> Option<ExsZone> {
+fn parse_zone(b: &[u8], be: bool) -> Option<ExsZone> {
     if b.len() < 96 {
         return None;
     }
-    let start = u32_at(b, 12, false) as u64;
-    let end = u32_at(b, 16, false) as u64;
-    let sample = i32::from_le_bytes(b[92..96].try_into().unwrap());
+    let start = u32_at(b, 12, be) as u64;
+    let end = u32_at(b, 16, be) as u64;
+    let sample = u32_at(b, 92, be) as i32;
     if sample < 0 {
         return None;
     }
+    // With the velocity-range flag clear, the stored range is stale (often
+    // 1..1) and the zone answers to any velocity.
+    let (vel_low, vel_high) = if b[0] & 0x08 != 0 {
+        (b[9] & 0x7F, b[10] & 0x7F)
+    } else {
+        (0, 127)
+    };
 
     Some(ExsZone {
         sample: sample as usize,
         root: b[1] & 0x7F,
         low: b[6] & 0x7F,
         high: b[7] & 0x7F,
-        vel_low: b[9] & 0x7F,
-        vel_high: b[10] & 0x7F,
+        vel_low,
+        vel_high,
         start,
         // `end` is inclusive of the final frame in Logic's own writer.
         length: end.saturating_sub(start),
         fine_tune: b[4] as i8,
         volume: b[5] as i8,
-        // Bit 3 is the pitch-tracking flag. Cleared, the zone plays at its
-        // recorded pitch whatever key triggers it, which is how drum and
-        // percussion maps are stored.
-        pitch: b[0] & 0x08 != 0,
+        // Bit 1 set turns pitch tracking off: the zone plays at its recorded
+        // pitch whatever key triggers it, which is how drum and percussion
+        // maps are stored.
+        pitch: b[0] & 0x02 == 0,
     })
 }
 
 /// Sample body layout: frame count and format up front, then two fixed-width
 /// string fields, the containing directory and the file name.
-fn parse_sample(b: &[u8], name: String) -> ExsSample {
-    let frames = u32_at(b, 4, false) as u64;
-    let rate = u32_at(b, 8, false);
-    let bits = u32_at(b, 12, false) as u16;
+fn parse_sample(b: &[u8], name: String, be: bool) -> ExsSample {
+    let frames = u32_at(b, 4, be) as u64;
+    let rate = u32_at(b, 8, be);
+    let bits = u32_at(b, 12, be) as u16;
     let dir = if b.len() > 80 {
         cstr(&b[80..b.len().min(80 + 256)])
     } else {
@@ -302,7 +313,21 @@ impl ExsSample {
             // the category subdirectory repeated. Apple's own libraries record
             // their build machine's paths, so this mapping is what actually
             // finds the factory content.
-            candidates.extend(parallel_sample_dirs(parent).map(|d| d.join(file)));
+            // Older libraries record a classic Mac path ("Disk:Folder:Kit:")
+            // that maps to nothing on disk, but its last folder names the
+            // sample set, which sits directly under the parallel audio tree.
+            let leaf = self
+                .dir
+                .trim_end_matches([':', '/', ' '])
+                .rsplit([':', '/'])
+                .next()
+                .unwrap_or("");
+            for d in parallel_sample_dirs(parent) {
+                if !leaf.is_empty() {
+                    candidates.push(d.join(leaf).join(file));
+                }
+                candidates.push(d.join(file));
+            }
         }
 
         for c in &candidates {
@@ -322,6 +347,9 @@ impl ExsSample {
             if let Some(up) = parent.parent() {
                 roots.push(up.to_path_buf());
             }
+            // GarageBand nests some sample sets a level down in its audio
+            // tree ("Sampler Files/Treated Percussion Sets/Perc-…").
+            roots.extend(parallel_sample_dirs(parent));
         }
         for root in roots {
             if let Some(hit) = find_nearby(&root, file, 2) {
@@ -496,15 +524,61 @@ mod tests {
         assert_eq!(inst.zones[1].length, 100);
     }
 
-    /// Zone bit 3 clear means the recording plays at its own pitch whatever
+    /// Zone bit 1 set means the recording plays at its own pitch whatever
     /// key triggers it, as drum maps are stored.
     #[test]
     fn reads_pitch_tracking_flag() {
         let mut off = zone_body((60, 0, 127), (0, 127), 0, 10, 0);
-        off[0] = 0x00;
+        off[0] = 0x08 | 0x02;
         let d = instrument(vec![off], vec![sample_body("/a", "s.aif", 10)]);
         let inst = ExsInstrument::parse(&d, Path::new("x.exs")).unwrap();
         assert!(!inst.zones[0].pitch);
+    }
+
+    /// With the velocity-range flag clear the stored range is ignored; Logic
+    /// leaves stale values like 1..1 there.
+    #[test]
+    fn ignores_velocity_range_when_flag_is_clear() {
+        let mut z = zone_body((60, 60, 60), (1, 1), 0, 10, 0);
+        z[0] = 0x03;
+        let d = instrument(vec![z], vec![sample_body("/a", "s.aif", 10)]);
+        let inst = ExsInstrument::parse(&d, Path::new("x.exs")).unwrap();
+        assert_eq!((inst.zones[0].vel_low, inst.zones[0].vel_high), (0, 127));
+    }
+
+    /// GarageBand's older files ("SOBT" magic) store chunk sizes and body
+    /// fields big-endian.
+    #[test]
+    fn parses_big_endian_files() {
+        let be_chunk = |ctype: u8, body: Vec<u8>| {
+            let mut c = vec![0u8; HEADER];
+            c[3] = ctype;
+            c[4..8].copy_from_slice(&(body.len() as u32).to_be_bytes());
+            c[16..20].copy_from_slice(b"SOBT");
+            c.extend(body);
+            c
+        };
+        let mut z = vec![0u8; 104];
+        z[0] = 0x02;
+        z[1] = 36;
+        z[6] = 36;
+        z[7] = 36;
+        z[12..16].copy_from_slice(&17u32.to_be_bytes());
+        z[16..20].copy_from_slice(&500u32.to_be_bytes());
+        z[92..96].copy_from_slice(&0i32.to_be_bytes());
+        let mut s = vec![0u8; 336];
+        s[4..8].copy_from_slice(&500u32.to_be_bytes());
+        s[8..12].copy_from_slice(&44100u32.to_be_bytes());
+        s[12..16].copy_from_slice(&16u32.to_be_bytes());
+
+        let mut d = be_chunk(0x00, vec![0u8; 40]);
+        d.extend(be_chunk(0x01, z));
+        d.extend(be_chunk(0x03, s));
+        let inst = ExsInstrument::parse(&d, Path::new("x.exs")).unwrap();
+        let z = &inst.zones[0];
+        assert_eq!((z.root, z.start, z.length), (36, 17, 483));
+        assert!(!z.pitch);
+        assert_eq!((inst.samples[0].frames, inst.samples[0].rate), (500, 44100));
     }
 
     /// A zone naming a sample that isn't in the table is dropped rather than

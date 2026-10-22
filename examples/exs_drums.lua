@@ -29,32 +29,50 @@ local snare = 38
 local clap = 39
 local hat = 42
 local open_hat = 46
+local tom_low = 41
+local tom_mid = 43
+local tom_high = 45
 
--- One bar of 16ths: kick on 1 and the "and" of 3, snare + clap on 2 and 4,
--- hats on every 8th with ghosted offbeats, an open hat to lead into the loop.
+-- Two bars of 16ths. Bar 1: kick on 1 and the "and" of 3, snare + clap on
+-- 2 and 4, hats on every 8th with ghosted offbeats, an open hat to lead on.
+-- Bar 2 repeats it but gives beat 4 to a tom fill rolling high to low.
 local notes = {}
 local function hit(pitch, step, velocity)
 	table.insert(notes, { pitch = pitch, start = step * 0.25, duration = 0.2, velocity = velocity })
 end
 
-for step = 0, 15 do
-	if step % 2 == 0 and step ~= 14 then
-		hit(hat, step, step % 4 == 0 and 90 or 55)
+local function groove(bar, fill)
+	local o = bar * 16
+	local last = fill and 11 or 13
+	for step = 0, last do
+		if step % 2 == 0 then
+			hit(hat, o + step, step % 4 == 0 and 90 or 55)
+		end
+	end
+
+	hit(kick, o + 0, 120)
+	hit(kick, o + 6, 95)
+	hit(kick, o + 10, 110)
+	hit(snare, o + 4, 115)
+	hit(clap, o + 4, 90)
+
+	if fill then
+		hit(tom_high, o + 12, 110)
+		hit(tom_high, o + 13, 85)
+		hit(tom_mid, o + 14, 105)
+		hit(tom_low, o + 15, 120)
+	else
+		hit(snare, o + 12, 115)
+		hit(clap, o + 12, 90)
+		hit(open_hat, o + 14, 80)
+		hit(snare, o + 15, 40) -- ghost note into the next bar
 	end
 end
-hit(open_hat, 14, 80)
 
-hit(kick, 0, 120)
-hit(kick, 6, 95)
-hit(kick, 10, 110)
+groove(0, false)
+groove(1, true)
 
-hit(snare, 4, 115)
-hit(clap, 4, 90)
-hit(snare, 12, 115)
-hit(clap, 12, 90)
-hit(snare, 15, 40) -- ghost note into the next bar
-
-song:phrase("Groove", { duration = 4.0, notes = notes })
+song:phrase("Groove", { duration = 8.0, notes = notes })
 
 song:track({
 	targets = { "Kit" },
